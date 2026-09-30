@@ -1,0 +1,15 @@
+# Apple Silicon MLX + TRL stack. Install via: ./setup_mlx_env.sh
+mlx
+mlx-lm
+torch
+trl[peft]>=0.15.0
+transformers>=4.56.2
+accelerate>=1.4.0
+datasets>=3.0.0
+safetensors
+sentencepiece
+protobuf
+huggingface_hub
+pyarrow
+pyyaml
+pytest
