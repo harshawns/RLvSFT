@@ -1,3 +1,4 @@
+# Note: imports currently expect configs/envs modules to be re-added.
 """
 GRPO training script (TRL) for countdown-style tasks.
 

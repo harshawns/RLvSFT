@@ -1,3 +1,3 @@
 # RLvSFT
 
-Compare SFT vs GRPO. Write your own pipeline here.
+This repository currently contains the GRPO training script (`train/grpo.py`). Other pieces will be rebuilt.
