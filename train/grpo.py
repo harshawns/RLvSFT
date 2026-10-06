@@ -2,11 +2,10 @@
 
 import argparse
 import json
-import random
 import sys
 from pathlib import Path
 
-from datasets import Dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
@@ -25,12 +24,23 @@ DEFAULT_LR = 2e-5
 BETA = 0.001
 TEMPERATURE = 1.0
 MODEL_ID = "arcee-ai/AFM-4.5B-Base"
-NUM_TRAIN_PROMPTS = 2048
+REQUIRED_COLUMNS = ("prompt", "numbers", "target")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TRL GRPO on countdown (AFM + LoRA)")
     parser.add_argument("--G", type=int, required=True, choices=(4, 8, 16))
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help=(
+            "Train data: local .parquet/.json/.jsonl path, a directory, "
+            "or a Hugging Face dataset id. Needs prompt, numbers, target "
+            "(or prompt + meta with those fields)."
+        ),
+    )
+    parser.add_argument("--dataset-split", type=str, default="train")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -41,26 +51,69 @@ def parse_args() -> argparse.Namespace:
         help="Path to an SFT LoRA adapter to continue from (SFT→GRPO arm).",
     )
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--num-train-prompts", type=int, default=NUM_TRAIN_PROMPTS)
     return parser.parse_args()
 
 
-def build_countdown_dataset(n: int, seed: int) -> Dataset:
-    env = CountdownEnv()
-    rows = []
-    for idx in range(n):
-        rng = random.Random(f"{seed}:countdown:train:{idx}")
-        ex = env.make_example(idx, rng, split="train")
-        rows.append(
-            {
-                "prompt": ex.prompt,
-                "answer": ex.answer,
-                "numbers": ex.meta["numbers"],
-                "target": ex.meta["target"],
-                "id": ex.id,
-            }
+def _parse_meta(meta):
+    if meta is None:
+        return {}
+    if isinstance(meta, str):
+        return json.loads(meta)
+    if isinstance(meta, dict):
+        return meta
+    raise TypeError(f"Unsupported meta type: {type(meta)}")
+
+
+def _normalize_row(row: dict) -> dict:
+    out = dict(row)
+    if "prompt" not in out:
+        raise ValueError(f"Row missing 'prompt'. Keys={sorted(out)}")
+
+    if "numbers" not in out or "target" not in out:
+        meta = _parse_meta(out.get("meta"))
+        if "numbers" not in out:
+            out["numbers"] = meta["numbers"]
+        if "target" not in out:
+            out["target"] = meta["target"]
+
+    if isinstance(out["numbers"], str):
+        out["numbers"] = json.loads(out["numbers"])
+    out["target"] = int(out["target"])
+    return out
+
+
+def load_train_dataset(source: str, split: str) -> Dataset:
+    path = Path(source)
+    if path.exists():
+        if path.is_dir():
+            dataset = load_dataset("parquet", data_dir=str(path), split=split)
+        else:
+            suffix = path.suffix.lower()
+            if suffix == ".parquet":
+                dataset = load_dataset("parquet", data_files=str(path), split="train")
+            elif suffix in {".jsonl", ".json"}:
+                dataset = load_dataset("json", data_files=str(path), split="train")
+            else:
+                raise ValueError(
+                    f"Unsupported local file type '{suffix}'. Use .parquet, .json, or .jsonl."
+                )
+    else:
+        dataset = load_dataset(source, split=split)
+
+    if isinstance(dataset, DatasetDict):
+        if split not in dataset:
+            raise ValueError(f"Split '{split}' not in dataset. Available: {list(dataset)}")
+        dataset = dataset[split]
+
+    dataset = dataset.map(_normalize_row)
+    missing = [c for c in REQUIRED_COLUMNS if c not in dataset.column_names]
+    if missing:
+        raise ValueError(
+            f"Dataset missing required columns {missing}. "
+            f"Have {dataset.column_names}. Provide prompt/numbers/target "
+            "or prompt + meta{{numbers,target}}."
         )
-    return Dataset.from_list(rows)
+    return dataset
 
 
 def make_countdown_reward():
@@ -125,13 +178,15 @@ def main() -> None:
         f"prompts/step={prompts_per_step} | max_steps={args.max_steps}"
     )
 
-    dataset = build_countdown_dataset(args.num_train_prompts, args.seed)
+    dataset = load_train_dataset(args.dataset, args.dataset_split)
+    print(dataset)
+    print(f"columns={dataset.column_names} | rows={len(dataset)}")
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = load_model(args.init_adapter)
 
-    # Fixed step geometry across G; do not set generation_batch_size.
     training_args = GRPOConfig(
         output_dir=output_dir,
         learning_rate=args.lr,
