@@ -13,15 +13,16 @@ import sys
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, load_dataset
-from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
 # ---------------------------------------------------------------------------
-# Imports from this repo (envs/) when launched as: python train/grpo.py
+# Imports from this repo when launched as: python train/grpo.py
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from configs import MODEL_ID, build_lora_config
 from envs.base import Example
 from envs.countdown import CountdownEnv
 
@@ -41,8 +42,6 @@ DEFAULT_LR = 2e-5
 # Pin RL sampling/KL; TRL defaults have changed between versions.
 BETA = 0.001  # KL coefficient vs reference policy
 TEMPERATURE = 1.0
-
-MODEL_ID = "arcee-ai/AFM-4.5B-Base"
 
 # Columns the countdown reward reads from the train dataset.
 REQUIRED_COLUMNS = ("prompt", "numbers", "target")
@@ -164,7 +163,82 @@ def load_train_dataset(source: str, split: str) -> Dataset:
             f"Have {dataset.column_names}. Provide prompt/numbers/target "
             "or prompt + meta{{numbers,target}}."
         )
+
+    # AFM-Base path assumes plain-string prompts (no chat template).
+    assert len(dataset) > 0, "Train dataset is empty"
+    assert isinstance(dataset[0]["prompt"], str), (
+        "prompt must be a plain string; message lists make TRL apply a chat "
+        f"template (AFM-Base template is unclear). Got {type(dataset[0]['prompt'])}"
+    )
     return dataset
+
+
+# ---------------------------------------------------------------------------
+# Token accounting — matched rollouts ≠ matched tokens across G arms
+# ---------------------------------------------------------------------------
+class CompletionTokenCallback(TrainerCallback):
+    """
+    Accumulate generated completion tokens from TRL's completions/mean_length.
+
+    step_tokens ≈ mean_length × rollouts_per_step
+    Use total_completion_tokens (not just steps) when plotting accuracy vs compute.
+    """
+
+    def __init__(self, rollouts_per_step: int, output_dir: str | Path):
+        self.rollouts_per_step = rollouts_per_step
+        self.output_dir = Path(output_dir)
+        self.total_completion_tokens = 0.0
+        self.history: list[dict] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        mean_len = logs.get("completions/mean_length")
+        if mean_len is None:
+            return
+
+        # Approximate tokens generated this optimizer step (64 rollouts).
+        step_tokens = float(mean_len) * self.rollouts_per_step
+        self.total_completion_tokens += step_tokens
+        row = {
+            "step": int(state.global_step),
+            "mean_completion_length": float(mean_len),
+            "step_tokens": step_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+        }
+        self.history.append(row)
+
+        # on_log runs after the trainer already flushed `logs`; push derived
+        # totals explicitly so W&B can plot accuracy vs tokens later.
+        if state.is_world_process_zero:
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log(
+                        {
+                            "completions/step_tokens": step_tokens,
+                            "completions/total_tokens": self.total_completion_tokens,
+                        },
+                        step=state.global_step,
+                    )
+            except Exception:
+                pass
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.output_dir / "completion_tokens.json"
+        payload = {
+            "rollouts_per_step": self.rollouts_per_step,
+            "total_completion_tokens": self.total_completion_tokens,
+            "num_logged_steps": len(self.history),
+            "history": self.history,
+        }
+        out_path.write_text(json.dumps(payload, indent=2) + "\n")
+        print(
+            f"Wrote token accounting → {out_path} "
+            f"(total_completion_tokens={self.total_completion_tokens:.0f})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -216,14 +290,8 @@ def load_model(init_adapter: str | None):
         # SFT → GRPO arm: continue training an existing adapter.
         model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True)
     else:
-        # Fresh LoRA for GRPO-from-base.
-        lora_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=16,
-            lora_alpha=32,
-            target_modules="all-linear",
-        )
-        model = get_peft_model(model, lora_config)
+        # Fresh LoRA for GRPO-from-base (same knobs as SFT via configs.py).
+        model = get_peft_model(model, build_lora_config())
 
     model.print_trainable_parameters()
     return model
@@ -287,6 +355,7 @@ def main() -> None:
         max_completion_length=1024,  # room for <think>…<answer>
         optim="adamw_8bit",
         max_steps=args.max_steps,  # matched compute; not num_train_epochs
+        warmup_ratio=0.03,  # short warmup; LR still decays linearly to 0 by default
         bf16=True,
         beta=BETA,
         temperature=TEMPERATURE,
@@ -308,12 +377,14 @@ def main() -> None:
 
     # --- train ---
     # Loop inside TRL: sample G completions/prompt → score → group-normalize → update.
+    token_cb = CompletionTokenCallback(ROLLOUTS_PER_STEP, output_dir)
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=[make_countdown_reward()],
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=[token_cb],
     )
 
     trainer.train()
