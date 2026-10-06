@@ -1,0 +1,13 @@
+alias: afm
+model_id: arcee-ai/AFM-4.5B-Base
+revision: null
+torch_dtype: bfloat16
+attn_implementation: sdpa
+trust_remote_code: false
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: all-linear
+pad_token_fallback: eos
+max_seq_length: 1024
+notes: "AFM Base (not instruct / Pre-Anneal / KDA-Only)."

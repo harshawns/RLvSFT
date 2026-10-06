@@ -1,323 +1,183 @@
-"""
-GRPO training script (TRL) for countdown-style tasks.
+#!/usr/bin/env python3
+"""Tiny GRPO runner for the feasibility harness (4 gens/prompt, 10–20 updates).
 
-Ablation design:
-  - Hold rollouts/optimizer-step fixed at 64 for every arm.
-  - Vary only --G (completions per prompt): 4, 8, or 16.
-  - Stop by --max-steps so compute matches across arms.
+Uses the real target_expr verifier reward (not length). For the fixed-geometry
+G-ablation trainer previously on main, see train/grpo_ablation.py.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import sys
 from pathlib import Path
 
-from datasets import Dataset, DatasetDict, load_dataset
-from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from trl import GRPOConfig, GRPOTrainer
+import yaml
 
-# ---------------------------------------------------------------------------
-# Imports from this repo (envs/) when launched as: python train/grpo.py
-# ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from envs.base import Example
-from envs.countdown import CountdownEnv
-
-# ---------------------------------------------------------------------------
-# Fixed experiment constants (same for every G arm)
-# ---------------------------------------------------------------------------
-# Completions used in one optimizer update. Must stay constant across --G.
-ROLLOUTS_PER_STEP = 64
-# How those 64 are built: microbatch × grad_accum (not via generation_batch_size).
-MICRO_BATCH_COMPLETIONS = 8  # per_device_train_batch_size
-GRAD_ACCUM_STEPS = 8  # 8 * 8 = 64 completions per optimizer step
-
-DEFAULT_MAX_STEPS = 400
-DEFAULT_SEED = 42
-DEFAULT_LR = 2e-5
-
-# Pin RL sampling/KL; TRL defaults have changed between versions.
-BETA = 0.001  # KL coefficient vs reference policy
-TEMPERATURE = 1.0
-
-MODEL_ID = "arcee-ai/AFM-4.5B-Base"
-
-# Columns the countdown reward reads from the train dataset.
-REQUIRED_COLUMNS = ("prompt", "numbers", "target")
+from envs.base import Example  # noqa: E402
+from envs.target_expr import TargetExprEnv  # noqa: E402
+from train.data_utils import load_jsonl, normalize_reward_row  # noqa: E402
+from train.logging_utils import RunLogger, reset_peak_vram  # noqa: E402
+from train.models import ModelConfig, write_run_metadata  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# CLI — sweep knobs live here; fixed geometry stays in constants above
-# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TRL GRPO on countdown (AFM + LoRA)")
-    parser.add_argument(
-        "--G",
-        type=int,
-        required=True,
-        choices=(4, 8, 16),
-        help="Group size (completions per prompt). Rollouts/step stay fixed at 64.",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        required=True,
-        help=(
-            "Your train data: local .parquet / .json / .jsonl path, a directory of those, "
-            "or a Hugging Face dataset id. Rows need prompt, numbers, target "
-            "(or prompt + meta JSON with numbers/target)."
-        ),
-    )
-    parser.add_argument(
-        "--dataset-split",
-        type=str,
-        default="train",
-        help="Split name when --dataset is a HF hub id or a DatasetDict (default: train).",
-    )
-    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument(
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model", required=True, choices=("qwen", "gemma", "afm"))
+    p.add_argument("--config", type=Path, default=ROOT / "train" / "configs" / "grpo_smoke.yaml")
+    p.add_argument("--dataset", type=Path, default=None)
+    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument(
         "--init-adapter",
         type=str,
         default=None,
-        help="Path to an SFT LoRA adapter to continue from (SFT→GRPO arm).",
+        help="SFT adapter path for the SFT→GRPO condition",
     )
-    parser.add_argument("--output-dir", type=str, default=None)
-    return parser.parse_args()
+    p.add_argument(
+        "--condition",
+        choices=("GRPO", "SFT→GRPO"),
+        default=None,
+        help="Logged condition name (default: GRPO or SFT→GRPO if --init-adapter)",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate configs/data without loading weights",
+    )
+    return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Dataset loading — bring your own file / HF id; normalize to reward columns
-# ---------------------------------------------------------------------------
-def _parse_meta(meta):
-    """meta may be missing, a JSON string, or already a dict."""
-    if meta is None:
-        return {}
-    if isinstance(meta, str):
-        return json.loads(meta)
-    if isinstance(meta, dict):
-        return meta
-    raise TypeError(f"Unsupported meta type: {type(meta)}")
+def _load_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
-def _normalize_row(row: dict) -> dict:
-    """
-    Map one raw row → {prompt, numbers, target, ...}.
+def make_reward_fn():
+    env = TargetExprEnv()
 
-    Accepts either flat columns or prompt + meta{numbers, target}.
-    """
-    out = dict(row)
-    if "prompt" not in out:
-        raise ValueError(f"Row missing 'prompt'. Keys={sorted(out)}")
-
-    # Pull reward fields out of meta if they aren't top-level columns.
-    if "numbers" not in out or "target" not in out:
-        meta = _parse_meta(out.get("meta"))
-        if "numbers" not in out:
-            out["numbers"] = meta["numbers"]
-        if "target" not in out:
-            out["target"] = meta["target"]
-
-    if isinstance(out["numbers"], str):
-        out["numbers"] = json.loads(out["numbers"])
-    out["target"] = int(out["target"])
-    return out
-
-
-def load_train_dataset(source: str, split: str) -> Dataset:
-    """Load user data from disk or the HF Hub, then normalize + validate schema."""
-    path = Path(source)
-
-    # --- resolve source ---
-    if path.exists():
-        if path.is_dir():
-            dataset = load_dataset("parquet", data_dir=str(path), split=split)
-        else:
-            suffix = path.suffix.lower()
-            if suffix == ".parquet":
-                dataset = load_dataset("parquet", data_files=str(path), split="train")
-            elif suffix in {".jsonl", ".json"}:
-                dataset = load_dataset("json", data_files=str(path), split="train")
-            else:
-                raise ValueError(
-                    f"Unsupported local file type '{suffix}'. Use .parquet, .json, or .jsonl."
-                )
-    else:
-        # Not a local path → treat as Hugging Face dataset id (e.g. org/name)
-        dataset = load_dataset(source, split=split)
-
-    # --- pick split if we got a DatasetDict ---
-    if isinstance(dataset, DatasetDict):
-        if split not in dataset:
-            raise ValueError(f"Split '{split}' not in dataset. Available: {list(dataset)}")
-        dataset = dataset[split]
-
-    # --- normalize rows, then fail fast on missing reward columns ---
-    dataset = dataset.map(_normalize_row)
-    missing = [c for c in REQUIRED_COLUMNS if c not in dataset.column_names]
-    if missing:
-        raise ValueError(
-            f"Dataset missing required columns {missing}. "
-            f"Have {dataset.column_names}. Provide prompt/numbers/target "
-            "or prompt + meta{{numbers,target}}."
-        )
-    return dataset
-
-
-# ---------------------------------------------------------------------------
-# Reward — TRL calls this on generated completions; returns one float each
-# ---------------------------------------------------------------------------
-def make_countdown_reward():
-    """Build a GRPO reward_fn that scores completions with CountdownEnv."""
-    env = CountdownEnv()
-
-    def reward_countdown(completions, numbers, target, **kwargs):
-        # `numbers` / `target` come from matching dataset columns (see REQUIRED_COLUMNS).
+    def reward_target_expr(completions, numbers, target, **kwargs):
         rewards = []
         for completion, nums, tgt in zip(completions, numbers, target):
             if isinstance(nums, str):
                 nums = json.loads(nums)
-
-            # CountdownEnv.score expects an Example with meta numbers/target.
             example = Example(
                 id="reward",
                 prompt="",
                 answer=str(tgt),
                 meta={"numbers": list(nums), "target": int(tgt)},
             )
-
-            # TRL may pass plain strings or chat-style message lists.
             if isinstance(completion, list):
                 text = completion[-1].get("content", "") if completion else ""
             else:
                 text = completion or ""
-
             rewards.append(float(env.score(example, text)["reward"]))
         return rewards
 
-    return reward_countdown
+    return reward_target_expr
 
 
-# ---------------------------------------------------------------------------
-# Model — base AFM + LoRA (fresh or continued from SFT adapter)
-# ---------------------------------------------------------------------------
-def load_model(init_adapter: str | None):
-    # No device_map: let the Trainer / vLLM colocate placement own the device.
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        torch_dtype="bfloat16",
-        attn_implementation="sdpa",  # safer than flash_attention_2 for AFM
-    )
-
-    if init_adapter:
-        # SFT → GRPO arm: continue training an existing adapter.
-        model = PeftModel.from_pretrained(model, init_adapter, is_trainable=True)
-    else:
-        # Fresh LoRA for GRPO-from-base.
-        lora_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=16,
-            lora_alpha=32,
-            target_modules="all-linear",
-        )
-        model = get_peft_model(model, lora_config)
-
-    model.print_trainable_parameters()
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Main — wire data, model, config, trainer; run GRPO
-# ---------------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+    smoke = _load_yaml(args.config)
+    cfg = ModelConfig.from_alias(args.model)
+    seed = int(args.seed if args.seed is not None else smoke.get("seed", 566))
+    max_steps = int(args.max_steps if args.max_steps is not None else smoke.get("max_steps", 15))
+    split_path = Path(args.dataset or smoke.get("split_path", "data/splits/target_expr_train.jsonl"))
+    if not split_path.is_absolute():
+        split_path = ROOT / split_path
 
-    # --- sanity checks on fixed batch geometry ---
-    if ROLLOUTS_PER_STEP % args.G != 0:
-        raise ValueError(
-            f"ROLLOUTS_PER_STEP ({ROLLOUTS_PER_STEP}) must be divisible by G ({args.G})"
-        )
-    if MICRO_BATCH_COMPLETIONS * GRAD_ACCUM_STEPS != ROLLOUTS_PER_STEP:
-        raise ValueError("Microbatch × grad accum must equal ROLLOUTS_PER_STEP")
+    condition = args.condition or ("SFT→GRPO" if args.init_adapter else "GRPO")
+    tag = "sft_grpo" if args.init_adapter else "grpo"
+    output_dir = args.output_dir or ROOT / "outputs" / f"{tag}_{args.model}_s{seed}"
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # prompts per optimizer step changes with G; rollouts (64) do not
-    prompts_per_step = ROLLOUTS_PER_STEP // args.G
-    lr_tag = f"{args.lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
-    run_name = f"grpo-G{args.G}-lr{lr_tag}-s{args.seed}"
-    output_dir = args.output_dir or f"GRPO/{run_name}"
-
-    print(
-        f"{run_name} | rollouts/step={ROLLOUTS_PER_STEP} | "
-        f"prompts/step={prompts_per_step} | max_steps={args.max_steps} | "
-        f"init_adapter={args.init_adapter!r}"
+    logger = RunLogger(
+        output_dir / "run.jsonl",
+        context={
+            "model": args.model,
+            "model_id": cfg.model_id,
+            "condition": condition,
+            "seed": seed,
+            "config": {**smoke, "model_config": cfg.alias, "init_adapter": args.init_adapter},
+        },
     )
-    print(
-        "Batch geometry: "
-        f"per_device_train_batch_size={MICRO_BATCH_COMPLETIONS} × "
-        f"gradient_accumulation_steps={GRAD_ACCUM_STEPS} = "
-        f"{ROLLOUTS_PER_STEP} completions/optimizer step (all G)."
+    reset_peak_vram()
+    logger.log("run_start", dataset=str(split_path), max_steps=max_steps, num_generations=smoke.get("num_generations", 4))
+
+    write_run_metadata(
+        output_dir,
+        cfg=cfg,
+        condition=condition,
+        seed=seed,
+        extra={
+            "split_path": str(split_path),
+            "max_steps": max_steps,
+            "init_adapter": args.init_adapter,
+            "smoke_config": smoke,
+        },
     )
 
-    # --- data / tokenizer / model ---
-    dataset = load_train_dataset(args.dataset, args.dataset_split)
-    print(dataset)
-    print(f"columns={dataset.column_names} | rows={len(dataset)}")
+    if args.dry_run:
+        if not split_path.exists():
+            raise SystemExit(f"Missing dataset: {split_path}. Run: python data/build_splits.py")
+        rows = [normalize_reward_row(r) for r in load_jsonl(split_path)]
+        cols = sorted(rows[0].keys()) if rows else []
+        logger.log("dry_run_ok", n_rows=len(rows), columns=cols)
+        logger.close(status="dry_run")
+        print(f"dry-run ok | model={args.model} | rows={len(rows)} | out={output_dir}")
+        return
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    from trl import GRPOConfig, GRPOTrainer
 
-    model = load_model(args.init_adapter)
+    from train.data_utils import load_hf_split
+    from train.logging_utils import MetricsCallback
+    from train.models import apply_lora, load_base_model, load_tokenizer
 
-    # --- GRPO hyperparameters ---
-    # Important: do NOT set generation_batch_size. That would generate 64 once and
-    # then split them across several optimizer steps (stale rollouts + unequal compute).
-    # With the defaults, each optimizer step generates a fresh set of 64 completions.
+    dataset = load_hf_split(str(split_path), "train").map(normalize_reward_row)
+    tokenizer = load_tokenizer(cfg)
+    model = load_base_model(cfg, device_map=None)
+    model = apply_lora(model, cfg, init_adapter=args.init_adapter)
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+
     training_args = GRPOConfig(
-        output_dir=output_dir,
-        learning_rate=args.lr,
-        # Fixed geometry across G arms:
-        per_device_train_batch_size=MICRO_BATCH_COMPLETIONS,  # 8
-        gradient_accumulation_steps=GRAD_ACCUM_STEPS,  # 8 → 64 / step
-        num_generations=args.G,  # only ablation knob in the batch math
-        max_prompt_length=512,
-        max_completion_length=1024,  # room for <think>…<answer>
-        optim="adamw_8bit",
-        max_steps=args.max_steps,  # matched compute; not num_train_epochs
-        bf16=True,
-        beta=BETA,
-        temperature=TEMPERATURE,
-        seed=args.seed,
-        data_seed=args.seed,
-        gradient_checkpointing=True,  # needed at long completion length
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=None,  # keep early ckpts for accuracy-vs-compute curves
-        logging_steps=1,
-        log_completions=True,  # inspect samples in W&B (catch reward hacking)
-        report_to=["wandb"],
-        remove_unused_columns=False,  # keep numbers/target for the reward fn
-        use_vllm=True,
-        vllm_mode="colocate",  # vLLM shares the training GPU
-        vllm_gpu_memory_utilization=0.3,  # leave headroom for the train model
-        run_name=run_name,
+        output_dir=str(output_dir),
+        learning_rate=float(smoke.get("learning_rate", 2e-5)),
+        per_device_train_batch_size=int(smoke.get("per_device_train_batch_size", 4)),
+        gradient_accumulation_steps=int(smoke.get("gradient_accumulation_steps", 1)),
+        num_generations=int(smoke.get("num_generations", 4)),
+        max_prompt_length=int(smoke.get("max_prompt_length", 512)),
+        max_completion_length=int(smoke.get("max_completion_length", 128)),
+        max_steps=max_steps,
+        bf16=bool(smoke.get("bf16", True)),
+        beta=float(smoke.get("beta", 0.04)),
+        temperature=float(smoke.get("temperature", 1.0)),
+        seed=seed,
+        data_seed=seed,
+        logging_steps=int(smoke.get("logging_steps", 1)),
+        report_to=list(smoke.get("report_to") or []),
+        remove_unused_columns=False,
+        use_vllm=bool(smoke.get("use_vllm", False)),
     )
 
-    # --- train ---
-    # Loop inside TRL: sample G completions/prompt → score → group-normalize → update.
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[make_countdown_reward()],
+        reward_funcs=[make_reward_fn()],
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
     )
-
+    MetricsCallback(logger).attach(trainer)
     trainer.train()
-    trainer.save_model(output_dir)
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+    logger.close(status="ok")
+    print(f"{condition} done | model={args.model} | out={output_dir}")
 
 
 if __name__ == "__main__":

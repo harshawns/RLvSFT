@@ -1,0 +1,13 @@
+alias: gemma
+model_id: google/gemma-3n-E4B
+revision: null
+torch_dtype: bfloat16
+attn_implementation: sdpa
+trust_remote_code: false
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: all-linear
+pad_token_fallback: eos
+max_seq_length: 1024
+notes: "Gemma license gated — accept https://huggingface.co/google/gemma-3n-E4B and set HF_TOKEN. Pretrained (not -it)."

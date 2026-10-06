@@ -1,0 +1,13 @@
+# Shared feasibility SFT schedule (per-model quirks live in qwen/gemma/afm.yaml).
+env: target_expr
+traces_path: traces/out/target_expr_train_oracle.jsonl
+num_train_epochs: 1
+max_steps: 40
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-5
+logging_steps: 1
+save_steps: 20
+bf16: true
+seed: 566
+report_to: []

@@ -2,10 +2,15 @@
 
 from .base import BaseEnv, Example
 from .countdown import CountdownEnv
+from .target_expr import TargetExprEnv
 
 ENV_REGISTRY: dict[str, type[BaseEnv]] = {
+    TargetExprEnv.name: TargetExprEnv,
     CountdownEnv.name: CountdownEnv,
 }
+
+# Default harness task for feasibility smokes.
+HARNESS_ENV = TargetExprEnv.name
 
 
 def get_env(name: str) -> BaseEnv:
@@ -20,6 +25,8 @@ __all__ = [
     "BaseEnv",
     "Example",
     "ENV_REGISTRY",
+    "HARNESS_ENV",
     "get_env",
+    "TargetExprEnv",
     "CountdownEnv",
 ]

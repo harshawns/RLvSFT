@@ -4,8 +4,18 @@ __pycache__/
 .python-version
 .DS_Store
 outputs/
-traces/out/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hf_cache/
+logs/
+wandb/
+GRPO/
+*.pt
+*.bin
+
+# Regenerable / large local artifacts; frozen splits + oracle traces are tracked.
+traces/out/*
+!traces/out/.gitkeep
+!traces/out/*_oracle.jsonl

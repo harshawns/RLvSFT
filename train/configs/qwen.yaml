@@ -1,0 +1,13 @@
+alias: qwen
+model_id: Qwen/Qwen3.5-4B-Base
+revision: null
+torch_dtype: bfloat16
+attn_implementation: sdpa
+trust_remote_code: false
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: all-linear
+pad_token_fallback: eos
+max_seq_length: 1024
+notes: "Apache-2.0 Base; prefer this ID over Qwen/Qwen3.5-4B."

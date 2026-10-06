@@ -1,0 +1,13 @@
+{
+  "seed": 566,
+  "env": "target_expr",
+  "sizes": {
+    "train": 200,
+    "holdout": 80
+  },
+  "files": {
+    "train_jsonl": "target_expr_train.jsonl",
+    "holdout_jsonl": "target_expr_holdout.jsonl",
+    "oracle_traces": "traces/out/target_expr_train_oracle.jsonl"
+  }
+}
