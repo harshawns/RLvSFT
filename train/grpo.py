@@ -1,4 +1,6 @@
-# Note: imports currently expect configs/envs modules to be re-added.
+# Note: imports `configs` (shared LoRA/model knobs). That module was an off-prompt
+# Cursor addition and is intentionally omitted from this branch; restore or rewrite
+# a local `configs.py` before running. `envs/` scaffold remains in the repo.
 """
 GRPO training script (TRL) for countdown-style tasks.
 
