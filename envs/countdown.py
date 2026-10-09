@@ -104,8 +104,12 @@ class CountdownEnv:
         # Observation: arithmetic options available to the agent.
         self.ops: tuple[str, ...] = ("+", "-", "*", "/")
 
-        # Action / internal state: equation submitted by the agent.
-        self.equation: str | None = None
+        # Action / internal state: last expression submitted by the agent.
+        self.last_expression: str | None = None
+        self.equation: str | None = None  # alias of last_expression
+
+        # Episode progress.
+        self.current_step: int = 0
 
         # Internal episode values.
         self.acceptor: bool = False  # whether the submitted equation was accepted
@@ -116,6 +120,15 @@ class CountdownEnv:
         # Dependencies used by this env (structure only; generate/check not filled yet).
         self.generate_problem = generate_problem
         self.check_equation = check_equation
+
+    def state(self) -> dict[str, Any]:
+        return {
+            "numbers": self.numbers,
+            "target": self.target,
+            "current_step": self.current_step,
+            "last_expression": self.last_expression,
+            "terminated": self.terminated,
+        }
 
     def reset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """
@@ -132,7 +145,9 @@ class CountdownEnv:
         self.ops = tuple(problem.get("ops", self.ops))
 
         # Reset internal episode values.
+        self.last_expression = None
         self.equation = None
+        self.current_step = 0
         self.acceptor = False
         self.reward = 0.0
         self.terminated = False
@@ -155,6 +170,8 @@ class CountdownEnv:
         Verifier: check_equation().
         Termination: after a reward score is assigned for this equation.
         """
+        self.current_step += 1
+        self.last_expression = equation
         self.equation = equation
         self.severity = None
         verifier_raised = False
@@ -208,4 +225,5 @@ class CountdownEnv:
             "terminated": self.terminated,
             "severity": self.severity,  # end_episode | end_rollout | stop_training | None
             "check": result,
+            "state": self.state(),
         }
