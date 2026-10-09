@@ -13,7 +13,7 @@ Observation space:
   use exactly once.
 
 Internal state:
-  Stores the equation submitted by the agent.
+  Stores the equation submitted by the agent, acceptor flag, and reward.
 
 Dependencies (to implement later):
   generate_problem() — create valid problems
@@ -69,6 +69,36 @@ class CountdownEnv:
         # Action / internal state: equation submitted by the agent.
         self.equation: str | None = None
 
+        # Internal episode values.
+        self.acceptor: bool = False  # whether the submitted equation was accepted
+        self.reward: float = 0.0
+
         # Dependencies used by this env (structure only; not wired yet).
         self.generate_problem = generate_problem
         self.check_equation = check_equation
+
+    def reset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """
+        Start a new episode.
+
+        1. Call generate_problem() for a fresh (numbers, target, ops).
+        2. Reset internal values: acceptor, reward, equation.
+        3. Return the starting observation for the agent.
+        """
+        problem = self.generate_problem(*args, **kwargs)
+
+        self.numbers = list(problem["numbers"])
+        self.target = int(problem["target"])
+        self.ops = tuple(problem.get("ops", self.ops))
+
+        # Reset internal episode values.
+        self.equation = None
+        self.acceptor = False
+        self.reward = 0.0
+
+        # Give the agent the start of the problem (observation).
+        return {
+            "numbers": list(self.numbers),
+            "target": self.target,
+            "ops": list(self.ops),
+        }
