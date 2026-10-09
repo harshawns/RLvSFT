@@ -104,6 +104,9 @@ class CountdownEnv:
         # Observation: arithmetic options available to the agent.
         self.ops: tuple[str, ...] = ("+", "-", "*", "/")
 
+        # Text prompt for the model (built in reset from the observation values).
+        self.prompt: str | None = None
+
         # Action / internal state: last expression submitted by the agent.
         self.last_expression: str | None = None
         self.equation: str | None = None  # alias of last_expression
@@ -121,6 +124,17 @@ class CountdownEnv:
         self.generate_problem = generate_problem
         self.check_equation = check_equation
 
+    def build_prompt(self) -> str:
+        """Turn current numbers / ops / target into a model prompt."""
+        ops = ", ".join(self.ops)
+        return (
+            f"Using each of the numbers {list(self.numbers)} exactly once, "
+            f"and only the operators {ops} and parentheses, write an expression "
+            f"that equals {self.target}.\n"
+            "Put step-by-step reasoning in <think>...</think> and the final "
+            "expression in <answer>...</answer>."
+        )
+
     def state(self) -> dict[str, Any]:
         return {
             "numbers": self.numbers,
@@ -128,6 +142,7 @@ class CountdownEnv:
             "current_step": self.current_step,
             "last_expression": self.last_expression,
             "terminated": self.terminated,
+            "prompt": self.prompt,
         }
 
     def reset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -136,13 +151,15 @@ class CountdownEnv:
 
         1. Call generate_problem() for a fresh (numbers, target, ops).
         2. Reset internal values: acceptor, reward, equation.
-        3. Return the starting observation for the agent.
+        3. Build a prompt that includes those values for the agent/model.
+        4. Return the starting observation (values + prompt).
         """
         problem = self.generate_problem(*args, **kwargs)
 
         self.numbers = list(problem["numbers"])
         self.target = int(problem["target"])
         self.ops = tuple(problem.get("ops", self.ops))
+        self.prompt = self.build_prompt()
 
         # Reset internal episode values.
         self.last_expression = None
@@ -153,11 +170,12 @@ class CountdownEnv:
         self.terminated = False
         self.severity = None
 
-        # Give the agent the start of the problem (observation).
+        # Give the agent the start of the problem (values + prompt).
         return {
             "numbers": list(self.numbers),
             "target": self.target,
             "ops": list(self.ops),
+            "prompt": self.prompt,
         }
 
     def step(self, equation: str) -> dict[str, Any]:
