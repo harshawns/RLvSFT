@@ -34,8 +34,9 @@ Randomness (to implement later):
 """
 
 from __future__ import annotations
-
+import random
 from typing import Any
+import operator
 
 # Error severity → what the training loop should do.
 SEVERITY_END_EPISODE = "end_episode"
@@ -43,7 +44,7 @@ SEVERITY_END_ROLLOUT = "end_rollout"
 SEVERITY_STOP_TRAINING = "stop_training"
 
 
-def generate_problem(*args: Any, **kwargs: Any) -> dict[str, Any]:
+def generate_problem(seed: int) -> dict[str, Any]:
     """
     Create a valid countdown problem.
 
@@ -51,10 +52,29 @@ def generate_problem(*args: Any, **kwargs: Any) -> dict[str, Any]:
     Expected return shape:
       {"numbers": list[int], "target": int, "ops": list[str]}
     """
-    raise NotImplementedError
+    rng = random.Random(seed)
+    numbers = rng.sample(range(1, 100), 4)
+    order_ids = rng.sample(range(4), 4)
+    op_ids = rng.choices(range(4), k=3)
+    ops = ["+", "-", "*", "/"]
+    math_fn = {
+        "+": operator.add,
+        "-": operator.sub,
+        "*": operator.mul,
+        "/": operator.truediv,
+    }
+    target = numbers[order_ids[0]]
+    for i in range(3):
+        target = math_fn[ops[op_ids[i]]](target, numbers[order_ids[i + 1]])
+    if target <= 0 or target != int(target):
+        return generate_problem(seed+1)
+    target_eq = (
+        f"{numbers[order_ids[0]]} {ops[op_ids[0]]} {numbers[order_ids[1]]} "
+        f"{ops[op_ids[1]]} {numbers[order_ids[2]]} {ops[op_ids[2]]} {numbers[order_ids[3]]}"
+    )
+    return {"numbers": numbers, "target": int(target), "ops": ops, "target_eq": target_eq}
 
-
-def check_equation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+def check_equation(equation: str, numbers: list[int], target: int, ops: list[str]) -> dict[str, Any]:
     """
     Check an equation submitted by the agent.
 
