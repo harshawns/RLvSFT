@@ -51,6 +51,38 @@ SEVERITY_STOP_TRAINING = "stop_training"
 
 OPS = ["+", "-", "*", "/"]
 
+_BINOPS: dict[type, Any] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+_OP_TO_AST: dict[str, type] = {
+    "+": ast.Add,
+    "-": ast.Sub,
+    "*": ast.Mult,
+    "/": ast.Div,
+}
+
+
+def _eval_ast(node: ast.AST, allowed_binops: set[type]) -> Fraction:
+    """Evaluate a whitelisted arithmetic AST to an exact Fraction."""
+    if isinstance(node, ast.Expression):
+        return _eval_ast(node.body, allowed_binops)
+    if isinstance(node, ast.Constant):
+        # bool is a subclass of int — reject True/False.
+        if isinstance(node.value, int) and not isinstance(node.value, bool):
+            return Fraction(node.value)
+        raise ValueError("only integer literals allowed")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _eval_ast(node.operand, allowed_binops)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.BinOp) and type(node.op) in allowed_binops:
+        left = _eval_ast(node.left, allowed_binops)
+        right = _eval_ast(node.right, allowed_binops)
+        return _BINOPS[type(node.op)](left, right)
+    raise ValueError("unsupported expression")
+
 
 def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
     """
@@ -93,14 +125,20 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
         f"Could not generate a valid puzzle after {max_attempts} attempts (seed={seed})"
     )
 
-def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, Any]:
+def check_equation(
+    equation: str,
+    numbers: list[int],
+    target: int,
+    ops: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """
     Check an equation submitted by the agent.
 
-    1) only digits / + - * / ( ) whitespace
+    1) only digits / allowed ops / ( ) whitespace; no ** or //
     2) each allowed number used exactly once
-    3) expression evaluates to target
+    3) AST-eval to Fraction equals target exactly
     """
+    allowed_ops = list(ops) if ops is not None else list(OPS)
     eq = (equation or "").strip()
     fail = lambda error, value=None: {
         "correct": False,
@@ -109,7 +147,11 @@ def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, 
         "error": error,
     }
 
-    if not re.fullmatch(r"[0-9+\-*/()\s]+", eq):
+    if "**" in eq or "//" in eq:
+        return fail("bad operators")
+
+    op_class = "".join(re.escape(op) for op in allowed_ops)
+    if not re.fullmatch(rf"[0-9{op_class}()\s]+", eq):
         return fail("bad characters")
 
     # Each allowed number exactly once.
@@ -121,13 +163,14 @@ def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, 
     if remaining:
         return fail(f"unused numbers {remaining}")
 
-    # Whitelist already limits what eval can see; keep this simple.
+    allowed_binops = {_OP_TO_AST[op] for op in allowed_ops if op in _OP_TO_AST}
     try:
-        value = eval(eq, {"__builtins__": {}}, {})
+        tree = ast.parse(eq, mode="eval")
+        value = _eval_ast(tree, allowed_binops)
     except Exception as exc:  # noqa: BLE001
         return fail(f"invalid expression: {exc}")
 
-    if abs(float(value) - float(target)) > 1e-6:
+    if value != Fraction(target):
         return fail(f"wrong answer {value} != {target}", value=float(value))
 
     return {"correct": True, "value": float(value), "equation": equation, "error": None}
@@ -144,7 +187,7 @@ class CountdownEnv:
         self.numbers: list[int] = []
 
         # Observation: arithmetic options available to the agent.
-        self.ops: tuple[str, ...] = OPS
+        self.ops: tuple[str, ...] = tuple(OPS)
 
         # Text prompt for the model (built in reset from the observation values).
         self.prompt: str | None = None
@@ -168,7 +211,7 @@ class CountdownEnv:
 
     def build_prompt(self) -> str:
         """Turn current numbers / ops / target into a model prompt."""
-        ops = ", ".join(OPS)
+        ops = ", ".join(self.ops)
         return (
             f"Using each of the numbers {list(self.numbers)} exactly once, "
             f"and only the operators {ops} and parentheses, write an expression "
@@ -220,7 +263,7 @@ class CountdownEnv:
         return {
             "numbers": list(self.numbers),
             "target": self.target,
-            "ops": list(OPS),
+            "ops": list(self.ops),
             "prompt": self.prompt,
         }
 
@@ -231,7 +274,49 @@ class CountdownEnv:
         Extracts <answer>...</answer>, then scores with check_equation().
         reward: 1 correct, 0 scored failure, None unscored (skip train).
         severity: set explicitly for failures (not via error-string matching).
+
+        Rejects step-before-reset and step-after-terminate (reward None).
         """
+        def _out(result: dict[str, Any], *, reward: float | None | object = ...) -> dict[str, Any]:
+            return {
+                "observation": {
+                    "numbers": list(self.numbers),
+                    "target": self.target,
+                    "ops": list(self.ops),
+                },
+                "equation": self.equation,
+                "reward": self.reward if reward is ... else reward,
+                "acceptor": self.acceptor,
+                "terminated": self.terminated,
+                "severity": self.severity,
+                "check": result,
+                "state": self.state(),
+            }
+
+        # Episode lifecycle guards — check before mutating scored state.
+        if self.target is None:
+            result = {
+                "correct": False,
+                "value": None,
+                "equation": "" if equation is None else str(equation),
+                "error": "step before reset",
+            }
+            self.reward = None
+            self.severity = SEVERITY_END_ROLLOUT
+            self.terminated = True
+            return _out(result)
+
+        if self.terminated:
+            result = {
+                "correct": False,
+                "value": None,
+                "equation": "" if equation is None else str(equation),
+                "error": "step after terminate",
+            }
+            # Keep prior self.reward/equation; this return is unscored.
+            self.severity = SEVERITY_END_ROLLOUT
+            return _out(result, reward=None)
+
         self.current_step += 1
         self.last_expression = equation
         self.equation = equation
@@ -241,22 +326,6 @@ class CountdownEnv:
         self.terminated = True
         result: dict[str, Any]
 
-        def _out() -> dict[str, Any]:
-            return {
-                "observation": {
-                    "numbers": list(self.numbers),
-                    "target": self.target,
-                    "ops": list(OPS),
-                },
-                "equation": self.equation,
-                "reward": self.reward,
-                "acceptor": self.acceptor,
-                "terminated": self.terminated,
-                "severity": self.severity,
-                "check": result,
-                "state": self.state(),
-            }
-
         if equation is None or str(equation).strip() == "":
             result = {
                 "correct": False,
@@ -265,7 +334,7 @@ class CountdownEnv:
                 "error": "empty equation",
             }
             self.severity = SEVERITY_END_ROLLOUT
-            return _out()
+            return _out(result)
 
         # Prompt asks for <answer>...</answer>; score only that body.
         tags = re.findall(
@@ -281,7 +350,7 @@ class CountdownEnv:
             }
             self.reward = 0.0
             self.severity = SEVERITY_END_EPISODE
-            return _out()
+            return _out(result)
 
         try:
             self.equation = expr
@@ -289,6 +358,7 @@ class CountdownEnv:
                 expr,
                 numbers=self.numbers,
                 target=self.target,
+                ops=self.ops,
             )
         except NotImplementedError:
             raise
@@ -304,7 +374,7 @@ class CountdownEnv:
                 self.severity = SEVERITY_STOP_TRAINING
             else:
                 self.severity = SEVERITY_END_ROLLOUT
-            return _out()  # reward stays None
+            return _out(result)  # reward stays None
 
         correct = bool(result.get("correct", False))
         self.acceptor = correct
@@ -314,4 +384,4 @@ class CountdownEnv:
         else:
             self.reward = 0.0
             self.severity = SEVERITY_END_EPISODE
-        return _out()
+        return _out(result)
