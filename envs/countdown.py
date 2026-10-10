@@ -192,9 +192,9 @@ class CountdownEnv:
         # Text prompt for the model (built in reset from the observation values).
         self.prompt: str | None = None
 
-        # Action / internal state: last expression submitted by the agent.
-        self.last_expression: str | None = None
-        self.equation: str | None = None  # alias of last_expression
+        # Action / internal state.
+        self.last_expression: str | None = None  # raw completion from the agent
+        self.equation: str | None = None  # extracted <answer> body (scored expression)
 
         # Episode progress.
         self.current_step: int = 0
@@ -205,7 +205,6 @@ class CountdownEnv:
         self.terminated: bool = False
         self.severity: str | None = None
 
-        # Dependencies used by this env (structure only; generate/check not filled yet).
         self.generate_problem = generate_problem
         self.check_equation = check_equation
 
@@ -340,13 +339,18 @@ class CountdownEnv:
         tags = re.findall(
             r"<answer>(.*?)</answer>", str(equation), flags=re.DOTALL | re.IGNORECASE
         )
-        expr = tags[-1].strip() if tags else ""
-        if not expr:
+        if not tags:
+            error = "missing <answer>...</answer>"
+            expr = ""
+        else:
+            expr = tags[-1].strip()
+            error = "empty <answer>" if not expr else None
+        if error is not None:
             result = {
                 "correct": False,
                 "value": None,
                 "equation": str(equation),
-                "error": "missing <answer>...</answer>",
+                "error": error,
             }
             self.reward = 0.0
             self.severity = SEVERITY_END_EPISODE
