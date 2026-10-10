@@ -34,15 +34,18 @@ Randomness (to implement later):
 """
 
 from __future__ import annotations
-import random
-from typing import Any
 import operator
+import random
+import re
 from fractions import Fraction
+from typing import Any
 
 # Error severity → what the training loop should do.
 SEVERITY_END_EPISODE = "end_episode"
 SEVERITY_END_ROLLOUT = "end_rollout"
 SEVERITY_STOP_TRAINING = "stop_training"
+
+OPS = ["+", "-", "*", "/"]
 
 
 def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
@@ -55,7 +58,6 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
       {"numbers": list[int], "target": int, "ops": list[str], "target_eq": str}
     """
     rng = random.Random(seed)
-    ops = ["+", "-", "*", "/"]
     math_fn = {
         "+": operator.add,
         "-": operator.sub,
@@ -66,7 +68,7 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
     for _ in range(max_attempts):
         numbers = rng.sample(range(1, 100), 4)
         ordered_numbers = rng.sample(numbers, len(numbers))
-        selected_ops = rng.choices(ops, k=len(numbers) - 1)
+        selected_ops = rng.choices(OPS, k=len(numbers) - 1)
 
         value = Fraction(ordered_numbers[0])
         expression = str(ordered_numbers[0])
@@ -87,7 +89,7 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
         f"Could not generate a valid puzzle after {max_attempts} attempts (seed={seed})"
     )
 
-def check_equation(equation: str, numbers: list[int], target: int, ops: list[str]) -> dict[str, Any]:
+def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, Any]:
     """
     Check an equation submitted by the agent.
 
@@ -98,8 +100,35 @@ def check_equation(equation: str, numbers: list[int], target: int, ops: list[str
     Expected return shape:
       {"correct": bool, "value": float | None, "equation": str, "error": str | None}
     """
+    # Each allowed number must appear exactly once (multiset match).
+    used = [int(x) for x in re.findall(r"\d+", equation or "")]
+    remaining = list(numbers)
+    for num in used:
+        if num not in remaining:
+            return {
+                "correct": False,
+                "value": None,
+                "equation": equation,
+                "error": f"unexpected number {num}",
+            }
+        remaining.remove(num)  # pop one occurrence after seeing it
+    if remaining:
+        return {
+            "correct": False,
+            "value": None,
+            "equation": equation,
+            "error": f"unused numbers {remaining}",
+        }
 
-    raise NotImplementedError
+    for op in OPS:
+        if op not in equation:
+            return {"correct": False, "value": None, "equation": equation, "error": "op not used"}
+    if not equation.isdigit():
+        return {"correct": False, "value": None, "equation": equation, "error": "not a number"}
+    if eval(equation) != target:
+        return {"correct": False, "value": None, "equation": equation, "error": "wrong answer"}
+    return {"correct": True, "value": eval(equation), "equation": equation, "error": None}
+
 
 
 def _error_severity(error: str | None, *, verifier_raised: bool = False) -> str | None:
@@ -136,7 +165,7 @@ class CountdownEnv:
         self.numbers: list[int] = []
 
         # Observation: arithmetic options available to the agent.
-        self.ops: tuple[str, ...] = ("+", "-", "*", "/")
+        self.ops: tuple[str, ...] = OPS
 
         # Text prompt for the model (built in reset from the observation values).
         self.prompt: str | None = None
@@ -160,7 +189,7 @@ class CountdownEnv:
 
     def build_prompt(self) -> str:
         """Turn current numbers / ops / target into a model prompt."""
-        ops = ", ".join(self.ops)
+        ops = ", ".join(OPS)
         return (
             f"Using each of the numbers {list(self.numbers)} exactly once, "
             f"and only the operators {ops} and parentheses, write an expression "
@@ -195,7 +224,7 @@ class CountdownEnv:
 
         self.numbers = list(problem["numbers"])
         self.target = int(problem["target"])
-        self.ops = tuple(problem.get("ops", self.ops))
+        self.ops = tuple(problem.get("ops", OPS))
         self.prompt = self.build_prompt()
 
         # Reset internal episode values.
@@ -212,7 +241,7 @@ class CountdownEnv:
         return {
             "numbers": list(self.numbers),
             "target": self.target,
-            "ops": list(self.ops),
+            "ops": list(OPS),
             "prompt": self.prompt,
         }
 
@@ -273,7 +302,7 @@ class CountdownEnv:
             "observation": {
                 "numbers": list(self.numbers),
                 "target": self.target,
-                "ops": list(self.ops),
+                "ops": list(OPS),
             },
             "equation": self.equation,
             "reward": self.reward,
