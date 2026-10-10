@@ -6,11 +6,12 @@ Goal:
   equation that evaluates to the goal number.
 
 Action space:
-  Agent submits an equation string.
+
+  Agent submits one equation string per episode.
 
 Observation space:
   Agent sees the goal number, allowed arithmetic ops, and the numbers it may
-  use exactly once.
+  use exactly once (plus a text prompt for the model).
 
 Internal state:
   Stores the equation submitted by the agent, acceptor flag, and reward.
@@ -18,27 +19,29 @@ Internal state:
 Step / reward:
   Reward is assigned when the agent submits an equation.
   Verifier is check_equation(). Success (nums exactly once + reach goal) → 1,
-  otherwise → 0. Episode still terminates after scoring either way.
+  otherwise → 0. Episode terminates after scoring either way.
 
 Failure handling (by severity):
   end_episode — bad/wrong answer for this problem
   end_rollout — unusable action / verifier failure for this trajectory
   stop_training — fatal / unexpected error (caller should halt)
 
-Dependencies (to implement later):
-  generate_problem() — create valid problems
-  check_equation()   — check the equation given by the agent
+Dependencies:
+  generate_problem() — create valid reachable puzzles
+  check_equation()   — verify the agent's equation
 
-Randomness (to implement later):
-  Random goal number and allowed numbers.
+Randomness:
+  generate_problem samples numbers/ops via a seeded RNG.
 """
 
 from __future__ import annotations
+
+import ast
 import operator
 import random
 import re
 from fractions import Fraction
-from typing import Any
+from typing import Any, Sequence
 
 # Error severity → what the training loop should do.
 SEVERITY_END_EPISODE = "end_episode"
@@ -81,7 +84,7 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
             return {
                 "numbers": numbers,
                 "target": int(value),
-                "ops": ops,
+                "ops": list(OPS),
                 "target_eq": expression,  # parenthesized left-fold; do not show to agent
             }
 
@@ -93,43 +96,40 @@ def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, 
     """
     Check an equation submitted by the agent.
 
-    Should verify:
-      - only allowed arithmetic / parentheses
-      - each allowed number used exactly once
-      - expression evaluates to the goal
-    Expected return shape:
-      {"correct": bool, "value": float | None, "equation": str, "error": str | None}
+    1) only digits / + - * / ( ) whitespace
+    2) each allowed number used exactly once
+    3) expression evaluates to target
     """
-    # Each allowed number must appear exactly once (multiset match).
-    used = [int(x) for x in re.findall(r"\d+", equation or "")]
+    eq = (equation or "").strip()
+    fail = lambda error, value=None: {
+        "correct": False,
+        "value": value,
+        "equation": equation,
+        "error": error,
+    }
+
+    if not re.fullmatch(r"[0-9+\-*/()\s]+", eq):
+        return fail("bad characters")
+
+    # Each allowed number exactly once.
     remaining = list(numbers)
-    for num in used:
+    for num in (int(x) for x in re.findall(r"\d+", eq)):
         if num not in remaining:
-            return {
-                "correct": False,
-                "value": None,
-                "equation": equation,
-                "error": f"unexpected number {num}",
-            }
-        remaining.remove(num)  # pop one occurrence after seeing it
+            return fail(f"unexpected number {num}")
+        remaining.remove(num)
     if remaining:
-        return {
-            "correct": False,
-            "value": None,
-            "equation": equation,
-            "error": f"unused numbers {remaining}",
-        }
+        return fail(f"unused numbers {remaining}")
 
-    for op in OPS:
-        if op not in equation:
-            return {"correct": False, "value": None, "equation": equation, "error": "op not used"}
-    if not equation.isdigit():
-        return {"correct": False, "value": None, "equation": equation, "error": "not a number"}
-    if eval(equation) != target:
-        return {"correct": False, "value": None, "equation": equation, "error": "wrong answer"}
-    return {"correct": True, "value": eval(equation), "equation": equation, "error": None}
+    # Whitelist already limits what eval can see; keep this simple.
+    try:
+        value = eval(eq, {"__builtins__": {}}, {})
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"invalid expression: {exc}")
 
+    if abs(float(value) - float(target)) > 1e-6:
+        return fail(f"wrong answer {value} != {target}", value=float(value))
 
+    return {"correct": True, "value": float(value), "equation": equation, "error": None}
 
 def _error_severity(error: str | None, *, verifier_raised: bool = False) -> str | None:
     """
