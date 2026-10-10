@@ -26,8 +26,7 @@ from trl import GRPOConfig, GRPOTrainer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from configs import MODEL_ID, build_lora_config
-from envs.base import Example
-from envs.countdown import CountdownEnv
+from envs.countdown import OPS, CountdownEnv
 
 # ---------------------------------------------------------------------------
 # Fixed experiment constants (same for every G arm)
@@ -258,21 +257,28 @@ def make_countdown_reward():
             if isinstance(nums, str):
                 nums = json.loads(nums)
 
-            # CountdownEnv.score expects an Example with meta numbers/target.
-            example = Example(
-                id="reward",
-                prompt="",
-                answer=str(tgt),
-                meta={"numbers": list(nums), "target": int(tgt)},
-            )
-
             # TRL may pass plain strings or chat-style message lists.
             if isinstance(completion, list):
                 text = completion[-1].get("content", "") if completion else ""
             else:
                 text = completion or ""
 
-            rewards.append(float(env.score(example, text)["reward"]))
+            # Bind the dataset puzzle (do not resample via generate_problem).
+            env.numbers = list(nums)
+            env.target = int(tgt)
+            env.ops = tuple(OPS)
+            env.terminated = False
+            env.reward = None
+            env.severity = None
+            env.acceptor = False
+            env.current_step = 0
+            env.last_expression = None
+            env.equation = None
+
+            out = env.step(text)
+            r = out["reward"]
+            # TRL expects a float per completion; unscored → 0.0.
+            rewards.append(0.0 if r is None else float(r))
         return rewards
 
     return reward_countdown
