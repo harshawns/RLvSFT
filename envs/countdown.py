@@ -17,14 +17,15 @@ Internal state:
   Stores the equation submitted by the agent, acceptor flag, and reward.
 
 Step / reward:
-  Reward is assigned when the agent submits an equation.
-  Verifier is check_equation(). Success (nums exactly once + reach goal) → 1,
-  otherwise → 0. Episode terminates after scoring either way.
+  Reward is assigned when the agent submits a completion.
+  Verifier is check_equation(). Success → 1, scored failure → 0,
+  unusable action / verifier crash → None (do not train on this sample).
+  Episode terminates after the submit either way.
 
-Failure handling (by severity):
-  end_episode — bad/wrong answer for this problem
-  end_rollout — unusable action / verifier failure for this trajectory
-  stop_training — fatal / unexpected error (caller should halt)
+Failure handling (by severity; set explicitly, not via error-string matching):
+  end_episode — bad/wrong answer for this problem (reward 0)
+  end_rollout — empty action / verifier crash (reward None)
+  stop_training — fatal infra error (reward None; caller should halt)
 
 Dependencies:
   generate_problem() — create valid reachable puzzles
@@ -131,28 +132,6 @@ def check_equation(equation: str, numbers: list[int], target: int) -> dict[str, 
 
     return {"correct": True, "value": float(value), "equation": equation, "error": None}
 
-def _error_severity(error: str | None, *, verifier_raised: bool = False) -> str | None:
-    """
-    Map a failure to a handling level.
-
-    - no error + incorrect → end_episode (valid attempt, wrong answer)
-    - format / constraint errors → end_episode
-    - verifier crash / empty action → end_rollout
-    - unexpected fatal → stop_training
-    """
-    if verifier_raised:
-        return SEVERITY_END_ROLLOUT
-    if error is None:
-        return None
-    fatal_markers = ("fatal", "internal", "oom", "cuda")
-    rollout_markers = ("empty", "timeout", "decode", "unavailable")
-    lowered = error.lower()
-    if any(m in lowered for m in fatal_markers):
-        return SEVERITY_STOP_TRAINING
-    if any(m in lowered for m in rollout_markers):
-        return SEVERITY_END_ROLLOUT
-    return SEVERITY_END_EPISODE
-
 
 class CountdownEnv:
     name = "countdown"
@@ -179,7 +158,7 @@ class CountdownEnv:
 
         # Internal episode values.
         self.acceptor: bool = False  # whether the submitted equation was accepted
-        self.reward: float = 0.0
+        self.reward: float | None = None  # 1 / 0 / None (unscored)
         self.terminated: bool = False
         self.severity: str | None = None
 
@@ -232,7 +211,7 @@ class CountdownEnv:
         self.equation = None
         self.current_step = 0
         self.acceptor = False
-        self.reward = 0.0
+        self.reward = None
         self.terminated = False
         self.severity = None
 
@@ -249,78 +228,90 @@ class CountdownEnv:
         """
         Agent submits a completion (reward timing = submit).
 
-        Extracts the expression from <answer>...</answer>, then scores it with
-        check_equation(). Success (nums exactly once + reach goal) → reward 1,
-        otherwise → 0. Episode still ends once scored.
+        Extracts <answer>...</answer>, then scores with check_equation().
+        reward: 1 correct, 0 scored failure, None unscored (skip train).
+        severity: set explicitly for failures (not via error-string matching).
         """
         self.current_step += 1
         self.last_expression = equation
         self.equation = equation
+        self.acceptor = False
+        self.reward = None
         self.severity = None
-        verifier_raised = False
+        self.terminated = True
         result: dict[str, Any]
 
-        try:
-            if equation is None or str(equation).strip() == "":
-                raise ValueError("empty equation")
-            # Prompt asks for <answer>...</answer>; score only that body.
-            tags = re.findall(
-                r"<answer>(.*?)</answer>", str(equation), flags=re.DOTALL | re.IGNORECASE
-            )
-            expr = tags[-1].strip() if tags else ""
-            if not expr:
-                result = {
-                    "correct": False,
-                    "value": None,
-                    "equation": str(equation),
-                    "error": "missing <answer>...</answer>",
-                }
-            else:
-                self.equation = expr
-                result = self.check_equation(
-                    expr,
-                    numbers=self.numbers,
-                    target=self.target,
-                )
-        except NotImplementedError:
-            # Dependency not filled yet — treat as rollout-level failure for callers.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            verifier_raised = True
+        def _out() -> dict[str, Any]:
+            return {
+                "observation": {
+                    "numbers": list(self.numbers),
+                    "target": self.target,
+                    "ops": list(OPS),
+                },
+                "equation": self.equation,
+                "reward": self.reward,
+                "acceptor": self.acceptor,
+                "terminated": self.terminated,
+                "severity": self.severity,
+                "check": result,
+                "state": self.state(),
+            }
+
+        if equation is None or str(equation).strip() == "":
             result = {
                 "correct": False,
                 "value": None,
-                "equation": str(equation) if equation is not None else "",
+                "equation": "" if equation is None else str(equation),
+                "error": "empty equation",
+            }
+            self.severity = SEVERITY_END_ROLLOUT
+            return _out()
+
+        # Prompt asks for <answer>...</answer>; score only that body.
+        tags = re.findall(
+            r"<answer>(.*?)</answer>", str(equation), flags=re.DOTALL | re.IGNORECASE
+        )
+        expr = tags[-1].strip() if tags else ""
+        if not expr:
+            result = {
+                "correct": False,
+                "value": None,
+                "equation": str(equation),
+                "error": "missing <answer>...</answer>",
+            }
+            self.reward = 0.0
+            self.severity = SEVERITY_END_EPISODE
+            return _out()
+
+        try:
+            self.equation = expr
+            result = self.check_equation(
+                expr,
+                numbers=self.numbers,
+                target=self.target,
+            )
+        except NotImplementedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "correct": False,
+                "value": None,
+                "equation": expr,
                 "error": str(exc),
             }
+            # Typed fatal vs rollout crash — no substring matching on messages.
+            if isinstance(exc, (MemoryError, SystemError)):
+                self.severity = SEVERITY_STOP_TRAINING
+            else:
+                self.severity = SEVERITY_END_ROLLOUT
+            return _out()  # reward stays None
 
         correct = bool(result.get("correct", False))
-
-        # Reward fn: 1 if constraints + goal satisfied, else 0.
-        # Wrong goal still ends the episode; reward just stays bad.
         self.acceptor = correct
-        self.reward = 1.0 if correct else 0.0
-        self.terminated = True  # episode over once we have a reward score
-
-        if not correct:
-            self.severity = _error_severity(
-                result.get("error"),
-                verifier_raised=verifier_raised,
-            )
-        else:
+        if correct:
+            self.reward = 1.0
             self.severity = None
-
-        return {
-            "observation": {
-                "numbers": list(self.numbers),
-                "target": self.target,
-                "ops": list(OPS),
-            },
-            "equation": self.equation,
-            "reward": self.reward,
-            "acceptor": self.acceptor,
-            "terminated": self.terminated,
-            "severity": self.severity,  # end_episode | end_rollout | stop_training | None
-            "check": result,
-            "state": self.state(),
-        }
+        else:
+            self.reward = 0.0
+            self.severity = SEVERITY_END_EPISODE
+        return _out()
