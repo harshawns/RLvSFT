@@ -18,13 +18,13 @@ Internal state:
 
 Step / reward:
   Reward is assigned when the agent submits a completion.
-  Verifier is check_equation(). Success → 1, scored failure → 0,
-  unusable action / verifier crash → None (do not train on this sample).
+  Verifier is check_equation(). Success → 1; any model failure (including
+  empty/EOS) → 0; infra/code bugs → None (do not train on this sample).
   Episode terminates after the submit either way.
 
 Failure handling (by severity; set explicitly, not via error-string matching):
-  end_episode — bad/wrong answer for this problem (reward 0)
-  end_rollout — empty action / verifier crash (reward None)
+  end_episode — model failure: empty/EOS, bad format, wrong answer (reward 0)
+  end_rollout — infra / code bug in the env path (reward None; do not train)
   stop_training — fatal infra error (reward None; caller should halt)
 
 Dependencies:
@@ -229,26 +229,23 @@ class CountdownEnv:
             "prompt": self.prompt,
         }
 
-    def reset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    def load_problem(
+        self,
+        numbers: Sequence[int],
+        target: int,
+        ops: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """
-        Start a new episode.
+        Bind an external puzzle and clear episode state.
 
-        1. Call generate_problem() for a fresh (numbers, target, ops).
-        2. Reset internal values: acceptor, reward, equation.
-        3. Build a prompt that includes those values for the agent/model.
-        4. Return the starting observation (values + prompt).
+        Used by GRPO (dataset rows) so scoring does not call generate_problem().
+        Note: target_eq is intentionally not returned (would leak the solution).
         """
-        if args or "seed" in kwargs:
-            problem = self.generate_problem(*args, **kwargs)
-        else:
-            problem = self.generate_problem(seed=random.randrange(1 << 30))
-
-        self.numbers = list(problem["numbers"])
-        self.target = int(problem["target"])
-        self.ops = tuple(problem.get("ops", OPS))
+        self.numbers = list(numbers)
+        self.target = int(target)
+        self.ops = tuple(ops) if ops is not None else tuple(OPS)
         self.prompt = self.build_prompt()
 
-        # Reset internal episode values.
         self.last_expression = None
         self.equation = None
         self.current_step = 0
@@ -257,8 +254,6 @@ class CountdownEnv:
         self.terminated = False
         self.severity = None
 
-        # Give the agent the start of the problem (values + prompt).
-        # Note: target_eq is intentionally not returned (would leak the solution).
         return {
             "numbers": list(self.numbers),
             "target": self.target,
@@ -266,12 +261,32 @@ class CountdownEnv:
             "prompt": self.prompt,
         }
 
+    def reset(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """
+        Start a new episode.
+
+        1. Call generate_problem() for a fresh (numbers, target, ops).
+        2. load_problem() to bind values and clear episode state.
+        3. Return the starting observation (values + prompt).
+        """
+        if args or "seed" in kwargs:
+            problem = self.generate_problem(*args, **kwargs)
+        else:
+            problem = self.generate_problem(seed=random.randrange(1 << 30))
+
+        return self.load_problem(
+            problem["numbers"],
+            problem["target"],
+            ops=problem.get("ops"),
+        )
+
     def step(self, equation: str) -> dict[str, Any]:
         """
         Agent submits a completion (reward timing = submit).
 
         Extracts <answer>...</answer>, then scores with check_equation().
-        reward: 1 correct, 0 scored failure, None unscored (skip train).
+        reward: 1 correct, 0 any model failure (empty/EOS, bad format, wrong),
+        None only for infra/code bugs (skip train).
         severity: set explicitly for failures (not via error-string matching).
 
         Rejects step-before-reset and step-after-terminate (reward None).
@@ -326,13 +341,15 @@ class CountdownEnv:
         result: dict[str, Any]
 
         if equation is None or str(equation).strip() == "":
+            # Model produced nothing (e.g. immediate EOS) — scored failure, not a bug.
             result = {
                 "correct": False,
                 "value": None,
                 "equation": "" if equation is None else str(equation),
                 "error": "empty equation",
             }
-            self.severity = SEVERITY_END_ROLLOUT
+            self.reward = 0.0
+            self.severity = SEVERITY_END_EPISODE
             return _out(result)
 
         # Prompt asks for <answer>...</answer>; score only that body.

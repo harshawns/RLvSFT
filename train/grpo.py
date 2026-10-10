@@ -1,6 +1,3 @@
-# Note: imports `configs` (shared LoRA/model knobs). That module was an off-prompt
-# Cursor addition and is intentionally omitted from this branch; restore or rewrite
-# a local `configs.py` before running. `envs/` scaffold remains in the repo.
 """
 GRPO training script (TRL) for countdown-style tasks.
 
@@ -26,7 +23,7 @@ from trl import GRPOConfig, GRPOTrainer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from configs import MODEL_ID, build_lora_config
-from envs.countdown import OPS, CountdownEnv
+from envs.countdown import CountdownEnv
 
 # ---------------------------------------------------------------------------
 # Fixed experiment constants (same for every G arm)
@@ -264,17 +261,7 @@ def make_countdown_reward():
                 text = completion or ""
 
             # Bind the dataset puzzle (do not resample via generate_problem).
-            env.numbers = list(nums)
-            env.target = int(tgt)
-            env.ops = tuple(OPS)
-            env.terminated = False
-            env.reward = None
-            env.severity = None
-            env.acceptor = False
-            env.current_step = 0
-            env.last_expression = None
-            env.equation = None
-
+            env.load_problem(nums, int(tgt))
             out = env.step(text)
             r = out["reward"]
             # TRL expects a float per completion; unscored → 0.0.
