@@ -247,13 +247,11 @@ class CountdownEnv:
 
     def step(self, equation: str) -> dict[str, Any]:
         """
-        Agent submits an equation (reward timing = submit).
+        Agent submits a completion (reward timing = submit).
 
-        Success: uses each number exactly once AND reaches the goal → reward 1.
-        Otherwise reward 0, but the episode still ends once scored.
-
-        Verifier: check_equation().
-        Termination: after a reward score is assigned for this equation.
+        Extracts the expression from <answer>...</answer>, then scores it with
+        check_equation(). Success (nums exactly once + reach goal) → reward 1,
+        otherwise → 0. Episode still ends once scored.
         """
         self.current_step += 1
         self.last_expression = equation
@@ -265,11 +263,25 @@ class CountdownEnv:
         try:
             if equation is None or str(equation).strip() == "":
                 raise ValueError("empty equation")
-            result = self.check_equation(
-                equation,
-                numbers=self.numbers,
-                target=self.target,
+            # Prompt asks for <answer>...</answer>; score only that body.
+            tags = re.findall(
+                r"<answer>(.*?)</answer>", str(equation), flags=re.DOTALL | re.IGNORECASE
             )
+            expr = tags[-1].strip() if tags else ""
+            if not expr:
+                result = {
+                    "correct": False,
+                    "value": None,
+                    "equation": str(equation),
+                    "error": "missing <answer>...</answer>",
+                }
+            else:
+                self.equation = expr
+                result = self.check_equation(
+                    expr,
+                    numbers=self.numbers,
+                    target=self.target,
+                )
         except NotImplementedError:
             # Dependency not filled yet — treat as rollout-level failure for callers.
             raise
