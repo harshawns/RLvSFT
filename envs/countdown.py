@@ -66,7 +66,7 @@ _OP_TO_AST: dict[str, type] = {
 
 
 def _eval_ast(node: ast.AST, allowed_binops: set[type]) -> Fraction:
-    """Evaluate a whitelisted arithmetic AST to an exact Fraction."""
+    """Evaluate a whitelisted arithmetic AST to an exact Fraction (no unary +/-)."""
     if isinstance(node, ast.Expression):
         return _eval_ast(node.body, allowed_binops)
     if isinstance(node, ast.Constant):
@@ -74,9 +74,7 @@ def _eval_ast(node: ast.AST, allowed_binops: set[type]) -> Fraction:
         if isinstance(node.value, int) and not isinstance(node.value, bool):
             return Fraction(node.value)
         raise ValueError("only integer literals allowed")
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        value = _eval_ast(node.operand, allowed_binops)
-        return value if isinstance(node.op, ast.UAdd) else -value
+    # No unary +/- (classic Countdown: only binary + - * /).
     if isinstance(node, ast.BinOp) and type(node.op) in allowed_binops:
         left = _eval_ast(node.left, allowed_binops)
         right = _eval_ast(node.right, allowed_binops)
