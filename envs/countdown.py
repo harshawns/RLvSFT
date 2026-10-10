@@ -222,7 +222,7 @@ class CountdownEnv:
 
     def state(self) -> dict[str, Any]:
         return {
-            "numbers": self.numbers,
+            "numbers": list(self.numbers),
             "target": self.target,
             "current_step": self.current_step,
             "last_expression": self.last_expression,
