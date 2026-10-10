@@ -37,6 +37,7 @@ from __future__ import annotations
 import random
 from typing import Any
 import operator
+from fractions import Fraction
 
 # Error severity → what the training loop should do.
 SEVERITY_END_EPISODE = "end_episode"
@@ -44,18 +45,16 @@ SEVERITY_END_ROLLOUT = "end_rollout"
 SEVERITY_STOP_TRAINING = "stop_training"
 
 
-def generate_problem(seed: int) -> dict[str, Any]:
+def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
     """
     Create a valid countdown problem.
 
-    Should randomly sample allowed numbers and a reachable goal target.
+    Constructively left-folds four numbers with random ops so the target is
+    reachable. Retries until the target is a positive integer in [1, 99999].
     Expected return shape:
-      {"numbers": list[int], "target": int, "ops": list[str]}
+      {"numbers": list[int], "target": int, "ops": list[str], "target_eq": str}
     """
     rng = random.Random(seed)
-    numbers = rng.sample(range(1, 100), 4)
-    order_ids = rng.sample(range(4), 4)
-    op_ids = rng.choices(range(4), k=3)
     ops = ["+", "-", "*", "/"]
     math_fn = {
         "+": operator.add,
@@ -63,16 +62,30 @@ def generate_problem(seed: int) -> dict[str, Any]:
         "*": operator.mul,
         "/": operator.truediv,
     }
-    target = numbers[order_ids[0]]
-    for i in range(3):
-        target = math_fn[ops[op_ids[i]]](target, numbers[order_ids[i + 1]])
-    if target <= 0 or target != int(target):
-        return generate_problem(seed+1)
-    target_eq = (
-        f"{numbers[order_ids[0]]} {ops[op_ids[0]]} {numbers[order_ids[1]]} "
-        f"{ops[op_ids[1]]} {numbers[order_ids[2]]} {ops[op_ids[2]]} {numbers[order_ids[3]]}"
+
+    for _ in range(max_attempts):
+        numbers = rng.sample(range(1, 100), 4)
+        ordered_numbers = rng.sample(numbers, len(numbers))
+        selected_ops = rng.choices(ops, k=len(numbers) - 1)
+
+        value = Fraction(ordered_numbers[0])
+        expression = str(ordered_numbers[0])
+        for op, number in zip(selected_ops, ordered_numbers[1:]):
+            value = math_fn[op](value, Fraction(number))
+            expression = f"({expression} {op} {number})"
+
+        # Exact positive integer in an allowed range.
+        if value.denominator == 1 and 1 <= value.numerator <= 99999:
+            return {
+                "numbers": numbers,
+                "target": int(value),
+                "ops": ops,
+                "target_eq": expression,  # parenthesized left-fold; do not show to agent
+            }
+
+    raise RuntimeError(
+        f"Could not generate a valid puzzle after {max_attempts} attempts (seed={seed})"
     )
-    return {"numbers": numbers, "target": int(target), "ops": ops, "target_eq": target_eq}
 
 def check_equation(equation: str, numbers: list[int], target: int, ops: list[str]) -> dict[str, Any]:
     """
@@ -85,6 +98,7 @@ def check_equation(equation: str, numbers: list[int], target: int, ops: list[str
     Expected return shape:
       {"correct": bool, "value": float | None, "equation": str, "error": str | None}
     """
+
     raise NotImplementedError
 
 
@@ -174,7 +188,10 @@ class CountdownEnv:
         3. Build a prompt that includes those values for the agent/model.
         4. Return the starting observation (values + prompt).
         """
-        problem = self.generate_problem(*args, **kwargs)
+        if args or "seed" in kwargs:
+            problem = self.generate_problem(*args, **kwargs)
+        else:
+            problem = self.generate_problem(seed=random.randrange(1 << 30))
 
         self.numbers = list(problem["numbers"])
         self.target = int(problem["target"])
@@ -191,6 +208,7 @@ class CountdownEnv:
         self.severity = None
 
         # Give the agent the start of the problem (values + prompt).
+        # Note: target_eq is intentionally not returned (would leak the solution).
         return {
             "numbers": list(self.numbers),
             "target": self.target,
