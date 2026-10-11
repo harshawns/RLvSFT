@@ -1,21 +1,23 @@
-from envs.countdown import generate_problem
-from envs.countdown import build_prompt
+import os
+import json
+from envs.countdown import CountdownEnv
 
-def build_splits_countdown(num_problems, split, **difficulty):
+
+def build_splits_countdown(path,num_problems, split, seen=None, **difficulty):
+    env = CountdownEnv()
     seed_starts = {
         "train": 0,
         "val": 1_000_000,
         "test": 2_000_000
     }
-
+    if seen is None:
+        seen = set()
     rows = []
-    seen = set()
     seed = seed_starts[split]
 
     while len(rows) < num_problems:
-        problem = generate_problem(seed)
+        problem = env.generate_problem(seed, **difficulty)
         seed += 1
-
         key = (
             tuple(sorted(problem["numbers"])),
             problem["target"]
@@ -23,17 +25,37 @@ def build_splits_countdown(num_problems, split, **difficulty):
 
         if key in seen:
             continue
-        if key["target"] < difficulty["min_target"] or key["target"] > difficulty["max_target"]:
-            continue
-        if problem["numbers"][0] < difficulty["min_number"] or problem["numbers"][-1] > difficulty["max_number"]:
-            continue
         seen.add(key)
 
         rows.append({
-            "prompt": build_prompt(problem),
+            "prompt": env.build_prompt(problem["numbers"], problem["target"]),
             "numbers": problem["numbers"],
             "target": problem["target"],
             "target_eq": problem["target_eq"]
         })
+    # at the path create a file with the rows
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d)
+    with open(path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return path, rows
 
-    return rows
+
+if __name__ == "__main__":
+    path = "data/countdown/train.jsonl"
+    num_problems_train = 10000
+    num_problems_val = 1000
+    num_problems_test = 1000
+    seen = set()
+    difficulty = {
+        "min_number": 1,
+        "max_number": 100,
+        "min_target": 1,
+        "max_target": 1000
+    }
+
+    train_data= build_splits_countdown(path, num_problems, split, seen, **difficulty)
+    val_data= build_splits_countdown("data/countdown/val.jsonl", num_problems_val, "val", seen, **difficulty)
+    test_data= build_splits_countdown("data/countdown/test.jsonl", num_problems, "test", seen, **difficulty)

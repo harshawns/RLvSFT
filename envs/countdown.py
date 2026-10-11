@@ -278,13 +278,13 @@ class CountdownEnv:
             file=sys.stderr,
         )
 
-    def build_prompt(self) -> str:
+    def build_prompt(self, numbers: list[int], target: int) -> str:
         """Turn current numbers / target into a model prompt (ops = global OPS)."""
         ops = ", ".join(OPS)
         return (
-            f"Using each of the numbers {list(self.numbers)} exactly once, "
+            f"Using each of the numbers {numbers} exactly once, "
             f"and only the operators {ops} and parentheses, write an expression "
-            f"that equals {self.target}.\n"
+            f"that equals {target}.\n"
             "Put step-by-step reasoning in <think>...</think> and the final "
             "expression in <answer>...</answer>."
         )
@@ -313,7 +313,7 @@ class CountdownEnv:
         self.numbers = list(numbers)
         self.target = int(target)
         self.ops = tuple(OPS)
-        self.prompt = self.build_prompt()
+        self.prompt = self.build_prompt(numbers, target)
 
         self.last_expression = None
         self.equation = None
