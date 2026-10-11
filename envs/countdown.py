@@ -33,7 +33,7 @@ Dependencies:
 
 Randomness / difficulty:
   generate_problem samples via a seeded RNG. Tunable knobs: num_numbers,
-  number range, target range, allowed ops (also set on CountdownEnv).
+  number range, target range (operators are always the global OPS).
 """
 
 from __future__ import annotations
@@ -92,23 +92,21 @@ def generate_problem(
     max_number: int = 99,
     min_target: int = 1,
     max_target: int = 99999,
-    ops: Sequence[str] | None = None,
     max_attempts: int = 1000,
 ) -> dict[str, Any]:
     """
     Create a valid countdown problem.
 
-    Constructively left-folds `num_numbers` values with random ops from `ops`
+    Constructively left-folds `num_numbers` values with random ops from OPS
     so the target is reachable. Retries until the target is an integer in
     [min_target, max_target].
 
     Difficulty knobs (tune base-model accuracy into a usable band):
-      num_numbers, min_number, max_number, min_target, max_target, ops
+      num_numbers, min_number, max_number, min_target, max_target
 
     Expected return shape:
       {"numbers": list[int], "target": int, "ops": list[str], "target_eq": str}
     """
-    allowed_ops = list(ops) if ops is not None else list(OPS)
     if num_numbers < 2:
         raise ValueError(f"num_numbers must be >= 2, got {num_numbers}")
     if min_number > max_number:
@@ -121,9 +119,6 @@ def generate_problem(
             f"number range [{min_number}, {max_number}] too small for "
             f"num_numbers={num_numbers}"
         )
-    unknown = [op for op in allowed_ops if op not in _OP_TO_AST]
-    if not allowed_ops or unknown:
-        raise ValueError(f"ops must be non-empty subset of {OPS}; bad={unknown}")
 
     rng = random.Random(seed)
     math_fn = {
@@ -137,7 +132,7 @@ def generate_problem(
     for _ in range(max_attempts):
         numbers = rng.sample(number_pool, num_numbers)
         ordered_numbers = rng.sample(numbers, len(numbers))
-        selected_ops = rng.choices(allowed_ops, k=len(numbers) - 1)
+        selected_ops = rng.choices(OPS, k=len(numbers) - 1)
 
         value = Fraction(ordered_numbers[0])
         expression = str(ordered_numbers[0])
@@ -153,7 +148,7 @@ def generate_problem(
             return {
                 "numbers": numbers,
                 "target": int(value),
-                "ops": list(allowed_ops),
+                "ops": list(OPS),
                 "target_eq": expression,  # parenthesized left-fold; do not show to agent
             }
 
@@ -161,23 +156,21 @@ def generate_problem(
         f"Could not generate a valid puzzle after {max_attempts} attempts "
         f"(seed={seed}, num_numbers={num_numbers}, "
         f"numbers=[{min_number},{max_number}], "
-        f"target=[{min_target},{max_target}], ops={allowed_ops})"
+        f"target=[{min_target},{max_target}], ops={OPS})"
     )
 
 def check_equation(
     equation: str,
     numbers: list[int],
     target: int,
-    ops: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """
     Check an equation submitted by the agent.
 
-    1) only digits / allowed ops / ( ) whitespace; no ** or //
+    1) only digits / OPS / ( ) whitespace; no ** or //
     2) each allowed number used exactly once
     3) AST-eval to Fraction equals target exactly
     """
-    allowed_ops = list(ops) if ops is not None else list(OPS)
     eq = (equation or "").strip()
     fail = lambda error, value=None: {
         "correct": False,
@@ -189,7 +182,7 @@ def check_equation(
     if "**" in eq or "//" in eq:
         return fail("bad operators")
 
-    op_class = "".join(re.escape(op) for op in allowed_ops)
+    op_class = "".join(re.escape(op) for op in OPS)
     if not re.fullmatch(rf"[0-9{op_class}()\s]+", eq):
         return fail("bad characters")
 
@@ -202,7 +195,7 @@ def check_equation(
     if remaining:
         return fail(f"unused numbers {remaining}")
 
-    allowed_binops = {_OP_TO_AST[op] for op in allowed_ops if op in _OP_TO_AST}
+    allowed_binops = {_OP_TO_AST[op] for op in OPS}
     try:
         tree = ast.parse(eq, mode="eval")
         value = _eval_ast(tree, allowed_binops)
@@ -226,7 +219,6 @@ class CountdownEnv:
         max_number: int = 99,
         min_target: int = 1,
         max_target: int = 99999,
-        ops: Sequence[str] | None = None,
         max_gen_attempts: int = 1000,
     ) -> None:
         # Difficulty defaults for reset() / generate_problem().
@@ -235,7 +227,6 @@ class CountdownEnv:
         self.max_number = max_number
         self.min_target = min_target
         self.max_target = max_target
-        self.gen_ops: tuple[str, ...] = tuple(ops) if ops is not None else tuple(OPS)
         self.max_gen_attempts = max_gen_attempts
 
         # Goal: reach this number.
@@ -244,8 +235,8 @@ class CountdownEnv:
         # Observation: numbers the agent may use exactly once.
         self.numbers: list[int] = []
 
-        # Observation: arithmetic options available to the agent.
-        self.ops: tuple[str, ...] = self.gen_ops
+        # Observation: arithmetic options (always global OPS).
+        self.ops: tuple[str, ...] = tuple(OPS)
 
         # Text prompt for the model (built in reset from the observation values).
         self.prompt: str | None = None
@@ -276,7 +267,6 @@ class CountdownEnv:
             "max_number": self.max_number,
             "min_target": self.min_target,
             "max_target": self.max_target,
-            "ops": self.gen_ops,
             "max_attempts": self.max_gen_attempts,
         }
 
@@ -289,8 +279,8 @@ class CountdownEnv:
         )
 
     def build_prompt(self) -> str:
-        """Turn current numbers / ops / target into a model prompt."""
-        ops = ", ".join(self.ops)
+        """Turn current numbers / target into a model prompt (ops = global OPS)."""
+        ops = ", ".join(OPS)
         return (
             f"Using each of the numbers {list(self.numbers)} exactly once, "
             f"and only the operators {ops} and parentheses, write an expression "
@@ -313,7 +303,6 @@ class CountdownEnv:
         self,
         numbers: Sequence[int],
         target: int,
-        ops: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """
         Bind an external puzzle and clear episode state.
@@ -323,7 +312,7 @@ class CountdownEnv:
         """
         self.numbers = list(numbers)
         self.target = int(target)
-        self.ops = tuple(ops) if ops is not None else tuple(OPS)
+        self.ops = tuple(OPS)
         self.prompt = self.build_prompt()
 
         self.last_expression = None
@@ -337,7 +326,7 @@ class CountdownEnv:
         return {
             "numbers": list(self.numbers),
             "target": self.target,
-            "ops": list(self.ops),
+            "ops": list(OPS),
             "prompt": self.prompt,
         }
 
@@ -345,7 +334,7 @@ class CountdownEnv:
         """
         Start a new episode.
 
-        1. Call generate_problem() for a fresh (numbers, target, ops).
+        1. Call generate_problem() for a fresh (numbers, target).
            Uses env difficulty defaults; override per-call via kwargs.
         2. load_problem() to bind values and clear episode state.
         3. Return the starting observation (values + prompt).
@@ -361,7 +350,6 @@ class CountdownEnv:
         return self.load_problem(
             problem["numbers"],
             problem["target"],
-            ops=problem.get("ops"),
         )
 
     def step(self, equation: str) -> dict[str, Any]:
@@ -465,7 +453,6 @@ class CountdownEnv:
             expr,
             numbers=self.numbers,
             target=self.target,
-            ops=self.ops,
         )
 
         correct = bool(result.get("correct", False))

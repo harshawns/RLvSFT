@@ -43,7 +43,7 @@ BETA = 0.001  # KL coefficient vs reference policy
 TEMPERATURE = 1.0
 
 # Columns the countdown reward reads from the train dataset.
-REQUIRED_COLUMNS = ("prompt", "numbers", "target", "ops")
+REQUIRED_COLUMNS = ("prompt", "numbers", "target")
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +64,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Your train data: local .parquet / .json / .jsonl path, a directory of those, "
-            "or a Hugging Face dataset id. Rows need prompt, numbers, target, ops "
-            "(or prompt + meta JSON with numbers/target/ops)."
+            "or a Hugging Face dataset id. Rows need prompt, numbers, target "
+            "(or prompt + meta JSON with numbers/target)."
         ),
     )
     parser.add_argument(
@@ -103,36 +103,26 @@ def _parse_meta(meta):
 
 def _normalize_row(row: dict) -> dict:
     """
-    Map one raw row → {prompt, numbers, target, ops, ...}.
+    Map one raw row → {prompt, numbers, target, ...}.
 
-    Accepts either flat columns or prompt + meta{numbers, target, ops}.
+    Accepts either flat columns or prompt + meta{numbers, target}.
+    Operators are always the global OPS in CountdownEnv (not per-row).
     """
     out = dict(row)
     if "prompt" not in out:
         raise ValueError(f"Row missing 'prompt'. Keys={sorted(out)}")
 
     # Pull reward fields out of meta if they aren't top-level columns.
-    need_meta = any(k not in out for k in ("numbers", "target", "ops"))
-    if need_meta:
+    if "numbers" not in out or "target" not in out:
         meta = _parse_meta(out.get("meta"))
         if "numbers" not in out:
             out["numbers"] = meta["numbers"]
         if "target" not in out:
             out["target"] = meta["target"]
-        if "ops" not in out and "ops" in meta:
-            out["ops"] = meta["ops"]
 
     if isinstance(out["numbers"], str):
         out["numbers"] = json.loads(out["numbers"])
     out["target"] = int(out["target"])
-
-    if "ops" not in out:
-        raise ValueError(
-            f"Row missing 'ops' (allowed operators for this puzzle). Keys={sorted(out)}"
-        )
-    if isinstance(out["ops"], str):
-        out["ops"] = json.loads(out["ops"])
-    out["ops"] = list(out["ops"])
     return out
 
 
@@ -170,8 +160,8 @@ def load_train_dataset(source: str, split: str) -> Dataset:
     if missing:
         raise ValueError(
             f"Dataset missing required columns {missing}. "
-            f"Have {dataset.column_names}. Provide prompt/numbers/target/ops "
-            "or prompt + meta{{numbers,target,ops}}."
+            f"Have {dataset.column_names}. Provide prompt/numbers/target "
+            "or prompt + meta{{numbers,target}}."
         )
 
     # AFM-Base path assumes plain-string prompts (no chat template).
@@ -258,14 +248,12 @@ def make_countdown_reward():
     """Build a GRPO reward_fn that scores completions with CountdownEnv."""
     env = CountdownEnv()
 
-    def reward_countdown(completions, numbers, target, ops, **kwargs):
+    def reward_countdown(completions, numbers, target, **kwargs):
         # Column args match REQUIRED_COLUMNS (see dataset normalize).
         rewards = []
-        for completion, nums, tgt, row_ops in zip(completions, numbers, target, ops):
+        for completion, nums, tgt in zip(completions, numbers, target):
             if isinstance(nums, str):
                 nums = json.loads(nums)
-            if isinstance(row_ops, str):
-                row_ops = json.loads(row_ops)
 
             # TRL may pass plain strings or chat-style message lists.
             if isinstance(completion, list):
@@ -274,7 +262,7 @@ def make_countdown_reward():
                 text = completion or ""
 
             # Bind the dataset puzzle (do not resample via generate_problem).
-            env.load_problem(nums, int(tgt), ops=row_ops)
+            env.load_problem(nums, int(tgt))
             out = env.step(text)
             r = out["reward"]
             # None means an env/caller bug — fail loud (do not map to 0).
@@ -384,7 +372,7 @@ def main() -> None:
         logging_steps=1,
         log_completions=True,  # inspect samples in W&B (catch reward hacking)
         report_to=["wandb"],
-        remove_unused_columns=False,  # keep numbers/target/ops for the reward fn
+        remove_unused_columns=False,  # keep numbers/target for the reward fn
         use_vllm=True,
         vllm_mode="colocate",  # vLLM shares the training GPU
         vllm_gpu_memory_utilization=0.3,  # leave headroom for the train model
