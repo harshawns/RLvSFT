@@ -31,8 +31,9 @@ Dependencies:
   generate_problem() — create valid reachable puzzles
   check_equation()   — verify the agent's equation
 
-Randomness:
-  generate_problem samples numbers/ops via a seeded RNG.
+Randomness / difficulty:
+  generate_problem samples via a seeded RNG. Tunable knobs: num_numbers,
+  number range, target range, allowed ops (also set on CountdownEnv).
 """
 
 from __future__ import annotations
@@ -83,15 +84,47 @@ def _eval_ast(node: ast.AST, allowed_binops: set[type]) -> Fraction:
     raise ValueError("unsupported expression")
 
 
-def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
+def generate_problem(
+    seed: int,
+    *,
+    num_numbers: int = 4,
+    min_number: int = 1,
+    max_number: int = 99,
+    min_target: int = 1,
+    max_target: int = 99999,
+    ops: Sequence[str] | None = None,
+    max_attempts: int = 1000,
+) -> dict[str, Any]:
     """
     Create a valid countdown problem.
 
-    Constructively left-folds four numbers with random ops so the target is
-    reachable. Retries until the target is a positive integer in [1, 99999].
+    Constructively left-folds `num_numbers` values with random ops from `ops`
+    so the target is reachable. Retries until the target is an integer in
+    [min_target, max_target].
+
+    Difficulty knobs (tune base-model accuracy into a usable band):
+      num_numbers, min_number, max_number, min_target, max_target, ops
+
     Expected return shape:
       {"numbers": list[int], "target": int, "ops": list[str], "target_eq": str}
     """
+    allowed_ops = list(ops) if ops is not None else list(OPS)
+    if num_numbers < 2:
+        raise ValueError(f"num_numbers must be >= 2, got {num_numbers}")
+    if min_number > max_number:
+        raise ValueError(f"min_number ({min_number}) > max_number ({max_number})")
+    if min_target > max_target:
+        raise ValueError(f"min_target ({min_target}) > max_target ({max_target})")
+    pool_size = max_number - min_number + 1
+    if pool_size < num_numbers:
+        raise ValueError(
+            f"number range [{min_number}, {max_number}] too small for "
+            f"num_numbers={num_numbers}"
+        )
+    unknown = [op for op in allowed_ops if op not in _OP_TO_AST]
+    if not allowed_ops or unknown:
+        raise ValueError(f"ops must be non-empty subset of {OPS}; bad={unknown}")
+
     rng = random.Random(seed)
     math_fn = {
         "+": operator.add,
@@ -99,11 +132,12 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
         "*": operator.mul,
         "/": operator.truediv,
     }
+    number_pool = range(min_number, max_number + 1)
 
     for _ in range(max_attempts):
-        numbers = rng.sample(range(1, 100), 4)
+        numbers = rng.sample(number_pool, num_numbers)
         ordered_numbers = rng.sample(numbers, len(numbers))
-        selected_ops = rng.choices(OPS, k=len(numbers) - 1)
+        selected_ops = rng.choices(allowed_ops, k=len(numbers) - 1)
 
         value = Fraction(ordered_numbers[0])
         expression = str(ordered_numbers[0])
@@ -111,17 +145,23 @@ def generate_problem(seed: int, max_attempts: int = 1000) -> dict[str, Any]:
             value = math_fn[op](value, Fraction(number))
             expression = f"({expression} {op} {number})"
 
-        # Exact positive integer in an allowed range.
-        if value.denominator == 1 and 1 <= value.numerator <= 99999:
+        # Exact integer in the requested target range.
+        if (
+            value.denominator == 1
+            and min_target <= value.numerator <= max_target
+        ):
             return {
                 "numbers": numbers,
                 "target": int(value),
-                "ops": list(OPS),
+                "ops": list(allowed_ops),
                 "target_eq": expression,  # parenthesized left-fold; do not show to agent
             }
 
     raise RuntimeError(
-        f"Could not generate a valid puzzle after {max_attempts} attempts (seed={seed})"
+        f"Could not generate a valid puzzle after {max_attempts} attempts "
+        f"(seed={seed}, num_numbers={num_numbers}, "
+        f"numbers=[{min_number},{max_number}], "
+        f"target=[{min_target},{max_target}], ops={allowed_ops})"
     )
 
 def check_equation(
@@ -178,7 +218,26 @@ def check_equation(
 class CountdownEnv:
     name = "countdown"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        num_numbers: int = 4,
+        min_number: int = 1,
+        max_number: int = 99,
+        min_target: int = 1,
+        max_target: int = 99999,
+        ops: Sequence[str] | None = None,
+        max_gen_attempts: int = 1000,
+    ) -> None:
+        # Difficulty defaults for reset() / generate_problem().
+        self.num_numbers = num_numbers
+        self.min_number = min_number
+        self.max_number = max_number
+        self.min_target = min_target
+        self.max_target = max_target
+        self.gen_ops: tuple[str, ...] = tuple(ops) if ops is not None else tuple(OPS)
+        self.max_gen_attempts = max_gen_attempts
+
         # Goal: reach this number.
         self.target: int | None = None
 
@@ -186,7 +245,7 @@ class CountdownEnv:
         self.numbers: list[int] = []
 
         # Observation: arithmetic options available to the agent.
-        self.ops: tuple[str, ...] = tuple(OPS)
+        self.ops: tuple[str, ...] = self.gen_ops
 
         # Text prompt for the model (built in reset from the observation values).
         self.prompt: str | None = None
@@ -209,6 +268,17 @@ class CountdownEnv:
 
         self.generate_problem = generate_problem
         self.check_equation = check_equation
+
+    def _difficulty_kwargs(self) -> dict[str, Any]:
+        return {
+            "num_numbers": self.num_numbers,
+            "min_number": self.min_number,
+            "max_number": self.max_number,
+            "min_target": self.min_target,
+            "max_target": self.max_target,
+            "ops": self.gen_ops,
+            "max_attempts": self.max_gen_attempts,
+        }
 
     def _note_unscored(self, error: str) -> None:
         """Log and count reward=None — these are caller/env bugs, not model fails."""
@@ -276,13 +346,17 @@ class CountdownEnv:
         Start a new episode.
 
         1. Call generate_problem() for a fresh (numbers, target, ops).
+           Uses env difficulty defaults; override per-call via kwargs.
         2. load_problem() to bind values and clear episode state.
         3. Return the starting observation (values + prompt).
         """
-        if args or "seed" in kwargs:
-            problem = self.generate_problem(*args, **kwargs)
+        merged = {**self._difficulty_kwargs(), **kwargs}
+        if args:
+            problem = self.generate_problem(*args, **merged)
         else:
-            problem = self.generate_problem(seed=random.randrange(1 << 30))
+            if "seed" not in merged:
+                merged["seed"] = random.randrange(1 << 30)
+            problem = self.generate_problem(**merged)
 
         return self.load_problem(
             problem["numbers"],
