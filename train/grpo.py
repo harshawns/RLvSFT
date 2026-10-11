@@ -264,8 +264,14 @@ def make_countdown_reward():
             env.load_problem(nums, int(tgt))
             out = env.step(text)
             r = out["reward"]
-            # TRL expects a float per completion; unscored → 0.0.
-            rewards.append(0.0 if r is None else float(r))
+            # None means an env/caller bug — fail loud (do not map to 0).
+            if r is None:
+                raise RuntimeError(
+                    "CountdownEnv returned unscored reward (bug). "
+                    f"error={out.get('check', {}).get('error')!r} "
+                    f"unscored_count={env.unscored_count}"
+                )
+            rewards.append(float(r))
         return rewards
 
     return reward_countdown

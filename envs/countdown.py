@@ -24,8 +24,8 @@ Step / reward:
 
 Failure handling (by severity; set explicitly, not via error-string matching):
   end_episode — model failure: empty/EOS, bad format, wrong answer (reward 0)
-  end_rollout — infra / code bug in the env path (reward None; do not train)
-  stop_training — fatal infra error (reward None; caller should halt)
+  end_rollout — caller/env misuse (reward None; counted via unscored_count)
+  Unexpected exceptions from check_equation propagate (do not swallow).
 
 Dependencies:
   generate_problem() — create valid reachable puzzles
@@ -41,6 +41,7 @@ import ast
 import operator
 import random
 import re
+import sys
 from fractions import Fraction
 from typing import Any, Sequence
 
@@ -199,12 +200,23 @@ class CountdownEnv:
 
         # Internal episode values.
         self.acceptor: bool = False  # whether the submitted equation was accepted
-        self.reward: float | None = None  # 1 / 0 / None (unscored)
+        self.reward: float | None = None  # 1 / 0 / None (unscored bug)
         self.terminated: bool = False
         self.severity: str | None = None
 
+        # Lifetime count of reward=None returns (should stay 0 in training).
+        self.unscored_count: int = 0
+
         self.generate_problem = generate_problem
         self.check_equation = check_equation
+
+    def _note_unscored(self, error: str) -> None:
+        """Log and count reward=None — these are caller/env bugs, not model fails."""
+        self.unscored_count += 1
+        print(
+            f"[CountdownEnv] unscored reward #{self.unscored_count}: {error}",
+            file=sys.stderr,
+        )
 
     def build_prompt(self) -> str:
         """Turn current numbers / ops / target into a model prompt."""
@@ -316,6 +328,7 @@ class CountdownEnv:
             self.reward = None
             self.severity = SEVERITY_END_ROLLOUT
             self.terminated = True
+            self._note_unscored(result["error"])
             return _out(result)
 
         if self.terminated:
@@ -327,6 +340,7 @@ class CountdownEnv:
             }
             # Keep prior self.reward/equation; this return is unscored.
             self.severity = SEVERITY_END_ROLLOUT
+            self._note_unscored(result["error"])
             return _out(result, reward=None)
 
         self.current_step += 1
@@ -371,29 +385,14 @@ class CountdownEnv:
             self.severity = SEVERITY_END_EPISODE
             return _out(result)
 
-        try:
-            self.equation = expr
-            result = self.check_equation(
-                expr,
-                numbers=self.numbers,
-                target=self.target,
-                ops=self.ops,
-            )
-        except NotImplementedError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            result = {
-                "correct": False,
-                "value": None,
-                "equation": expr,
-                "error": str(exc),
-            }
-            # Typed fatal vs rollout crash — no substring matching on messages.
-            if isinstance(exc, (MemoryError, SystemError)):
-                self.severity = SEVERITY_STOP_TRAINING
-            else:
-                self.severity = SEVERITY_END_ROLLOUT
-            return _out(result)  # reward stays None
+        # check_equation already catches bad model output; let real bugs propagate.
+        self.equation = expr
+        result = self.check_equation(
+            expr,
+            numbers=self.numbers,
+            target=self.target,
+            ops=self.ops,
+        )
 
         correct = bool(result.get("correct", False))
         self.acceptor = correct
