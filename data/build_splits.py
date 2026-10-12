@@ -44,7 +44,9 @@ def build_splits_countdown(path,num_problems, split, seen=None, **difficulty):
 
 
 if __name__ == "__main__":
-    path = "data/countdown/train.jsonl"
+    path1 = "data/countdown/train.jsonl"
+    path2 = "data/countdown/val.jsonl"
+    path3 = "data/countdown/test.jsonl"
     num_problems_train = 10000
     num_problems_val = 1000
     num_problems_test = 1000
@@ -56,6 +58,12 @@ if __name__ == "__main__":
         "max_target": 1000
     }
 
-    train_data= build_splits_countdown(path, num_problems, split, seen, **difficulty)
-    val_data= build_splits_countdown("data/countdown/val.jsonl", num_problems_val, "val", seen, **difficulty)
-    test_data= build_splits_countdown("data/countdown/test.jsonl", num_problems, "test", seen, **difficulty)
+    train_data = build_splits_countdown(
+        path1, num_problems_train, "train", seen, **difficulty
+    )
+    val_data = build_splits_countdown(
+        path2, num_problems_val, "val", seen, **difficulty
+    )
+    test_data = build_splits_countdown(
+        path3, num_problems_test, "test", seen, **difficulty
+    )
